@@ -271,6 +271,77 @@ __global__ void multiGPU_feat_cache_lookup(
 	}
 }
 
+// 按照 shard_ids 给出的节点列表，从整张图的特征矩阵 cpu_float_features 里把对应节点的特征抽出来，紧凑地拷到当前 shard 的连续存储 coordinate_shard 中。
+__global__ void gather_coordinate_shard(
+    float* cpu_float_features,
+    int32_t float_feature_len,
+    int32_t* shard_ids,
+    int64_t shard_size,
+    float* coordinate_shard)
+{
+    for (int64_t thread_idx = threadIdx.x + blockDim.x * blockIdx.x;
+         thread_idx < shard_size * float_feature_len;
+         thread_idx += blockDim.x * gridDim.x) {
+        int64_t local_id = thread_idx / float_feature_len;
+        int32_t feat_offset = thread_idx % float_feature_len;
+        int32_t node_id = shard_ids[local_id];
+        if (node_id >= 0) {
+            coordinate_shard[thread_idx] =
+                cpu_float_features[int64_t(node_id) * float_feature_len + feat_offset];
+        }
+    }
+}
+
+__global__ void coord_shard_lookup(
+    float** coordinate_shards,
+    int64_t* shard_offsets,
+    int32_t shard_count,
+    int32_t* root_positions,
+    int32_t float_feature_len,
+    int32_t* sampled_ids,
+    int32_t* node_counter,
+    float* dst_float_buffer,
+    int32_t op_id)
+{
+    // 当前的OP处理的节点在 sampled_ids 中的起始偏移
+    int32_t node_off = node_counter[(op_id % INTRABATCH_CON) * 2];
+    // 当前这一步要处理多少个节点
+    int32_t batch_size = node_counter[(op_id % INTRABATCH_CON) * 2 + 1];
+    for (int64_t thread_idx = threadIdx.x + blockDim.x * blockIdx.x;
+         thread_idx < int64_t(batch_size) * float_feature_len;
+         thread_idx += blockDim.x * gridDim.x) {
+        // 当前 batch 内第几个节点
+        int32_t local_node = thread_idx / float_feature_len;
+        // 这个节点的第几维特征
+        int32_t feat_offset = thread_idx % float_feature_len;
+        // 拿到的是全局节点编号，不是 shard 内部编号
+        int32_t global_id = sampled_ids[node_off + local_node];
+        // 计算输出写入位置
+        int64_t dst_offset = int64_t(node_off + local_node) * float_feature_len + feat_offset;
+        if (global_id < 0) {
+            dst_float_buffer[dst_offset] = 0.0f;
+            continue;
+        }
+        // global_id 映射成 shard_idx
+        int32_t gidx = root_positions[global_id];
+        // gidx小于0代表没有写入unified shard
+        if (gidx < 0) {
+            dst_float_buffer[dst_offset] = 0.0f;
+            continue;
+        }
+        int32_t shard = 0;
+        // 因为每个shard存储特征的数量不是相同的，所以需要累加比对，确定索引在哪个shard区间
+        while (shard + 1 < shard_count && gidx >= shard_offsets[shard + 1]) {
+            shard++;
+        }
+        // 算出 shard 内部的 offset
+        int64_t local_id = int64_t(gidx) - shard_offsets[shard];
+        // 将shard上的读取真实特征
+        dst_float_buffer[dst_offset] =
+            coordinate_shards[shard][local_id * float_feature_len + feat_offset];
+    }
+}
+
 
 
 void mmap_cache_read(std::string &cache_file, std::vector<int32_t>& cache_map){

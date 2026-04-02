@@ -1,4 +1,5 @@
 #include <semaphore.h>
+#include <cstdint>
 
 #define INTRABATCH_CON 3
 #define INTERBATCH_CON 2
@@ -13,6 +14,7 @@ public:
   virtual int32_t* GetAggDst() = 0;
   virtual int32_t* GetNodeCounter() = 0;
   virtual int32_t* GetEdgeCounter() = 0;
+  virtual float* GetLocalCoordinateShard() = 0;
   virtual int32_t GetTrainStep() = 0;
   virtual int32_t GetValidStep() = 0;
   virtual int32_t GetTestStep() = 0;

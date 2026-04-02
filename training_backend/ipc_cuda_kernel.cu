@@ -16,7 +16,6 @@
 #define MAX_DEVICE 8
 #define MEMORY_USAGE 7
 
-// Macro for checking cuda errors following a cuda launch or api call
 #define cudaCheckError()                                       \
   {                                                            \
     cudaError_t e = cudaGetLastError();                        \
@@ -27,18 +26,24 @@
     }                                                          \
   }
 
-  typedef struct shmStruct_st {
-    int32_t steps[3];
-    cudaIpcMemHandle_t memHandle[MAX_DEVICE][INTERBATCH_CON][MEMORY_USAGE];
-  } shmStruct;
+typedef struct shmStruct_st {
+  int32_t steps[3];
+  int32_t serve_mode;
+  int32_t coord_shard_count;
+  int64_t coord_shard_starts[MAX_DEVICE];
+  int64_t coord_shard_sizes[MAX_DEVICE];
+  cudaIpcMemHandle_t coordHandle[MAX_DEVICE];
+  cudaIpcMemHandle_t memHandle[MAX_DEVICE][INTERBATCH_CON][MEMORY_USAGE];
+} shmStruct;
 
 class GPUIPCEnv : public IPCEnv {
-public: 
+public:
   int Initialize() override {
     volatile shmStruct *shm = NULL;
     int central_device = -1;
     cudaGetDevice(&central_device);
     cudaCheckError();
+    central_device_ = central_device;
     sharedMemoryInfo info;
     const char shmName[] = "simpleIPCshm";
     if (sharedMemoryCreate(shmName, sizeof(*shm), &info) != 0) {
@@ -57,6 +62,8 @@ public:
     agg_dst_.resize(INTERBATCH_CON);
     node_counter_.resize(INTERBATCH_CON);
     edge_counter_.resize(INTERBATCH_CON);
+    coord_shard_count_ = shm->coord_shard_count;
+    local_coordinate_shard_ = nullptr;
 
     for(int i = 0; i < INTERBATCH_CON; i++){
       cudaIpcOpenMemHandle(&ids_[i], *(cudaIpcMemHandle_t*)&shm->memHandle[central_device][i][0], cudaIpcMemLazyEnablePeerAccess);
@@ -67,6 +74,23 @@ public:
       cudaIpcOpenMemHandle(&node_counter_[i], *(cudaIpcMemHandle_t*)&shm->memHandle[central_device][i][5], cudaIpcMemLazyEnablePeerAccess);
       cudaIpcOpenMemHandle(&edge_counter_[i], *(cudaIpcMemHandle_t*)&shm->memHandle[central_device][i][6], cudaIpcMemLazyEnablePeerAccess);
       cudaCheckError();
+    }
+
+    if (coord_shard_count_ > 0) {
+      // 训练端装载shard指针的容器
+      coordinate_shards_.resize(coord_shard_count_, nullptr);
+      for (int32_t shard = 0; shard < coord_shard_count_; ++shard) {
+        // 从共享内存 shm->coordHandle[shard] 里取出一个 CUDA IPC handle，然后在当前进程中把它打开，得到一个可用的设备指针，存到 coordinate_shards_[shard] 里。
+        if (shm->coord_shard_sizes[shard] > 0) {
+          cudaIpcOpenMemHandle(&coordinate_shards_[shard], *(cudaIpcMemHandle_t*)&shm->coordHandle[shard], cudaIpcMemLazyEnablePeerAccess);
+          cudaCheckError();
+        }
+      }
+      // 单独保存一份本卡的shard指针
+      // 更新坐标时，当前训练进程只需要写自己这一张卡对应的本地 shard
+      if (central_device_ >= 0 && central_device_ < coord_shard_count_) {
+        local_coordinate_shard_ = coordinate_shards_[central_device_];
+      }
     }
     std::cout<<"CUDA: "<<central_device<<" IPC shared memory opened\n";
 
@@ -123,9 +147,11 @@ public:
   int32_t* GetNodeCounter() override {
     return (int32_t*)(node_counter_[current_pipe_]);
   }
-
   int32_t* GetEdgeCounter() override {
     return (int32_t*)(edge_counter_[current_pipe_]);
+  }
+  float* GetLocalCoordinateShard() override {
+    return local_coordinate_shard_;
   }
   int32_t GetTrainStep() override {
     return train_step_;
@@ -151,6 +177,12 @@ public:
         std::cout<<"close sem "<<i<<" failed\n";
       }
     }
+    // 关闭handle
+    for (int32_t shard = 0; shard < coord_shard_count_; ++shard) {
+      if (coordinate_shards_[shard] != nullptr) {
+        cudaIpcCloseMemHandle(coordinate_shards_[shard]);
+      }
+    }
   }
 private:
   std::vector<void*> ids_;
@@ -160,23 +192,52 @@ private:
   std::vector<void*> agg_dst_;
   std::vector<void*> node_counter_;
   std::vector<void*> edge_counter_;
+  std::vector<float*> coordinate_shards_;
   std::vector<sem_t*> semw_;
   std::vector<sem_t*> semr_;
+  // 特征更新时本地修改的指针
+  float* local_coordinate_shard_;
 
   int32_t train_step_;
   int32_t valid_step_;
   int32_t test_step_;
+  int32_t coord_shard_count_;
+  int32_t central_device_;
   int current_pipe_;
 };
+
 IPCEnv* NewIPCEnv(){
   return new GPUIPCEnv();
 }
 
-// Define the GPU implementation that launches the CUDA kernel.
+// 把当前 batch 里推理得到的 updated_feat，按 root_local_offsets 写回本地 GPU 的 coord shard。
+__global__ void update_local_coordinate_shard_kernel(
+    int32_t* root_local_offsets,
+    // 推理后算出来的新特征[root_count, coord_dim]
+    float* updated_coords,
+    int32_t root_count,
+    int32_t coord_dim,
+    float* local_coordinate_shard) {
+  for (int64_t thread_idx = threadIdx.x + blockDim.x * blockIdx.x;
+       thread_idx < int64_t(root_count) * coord_dim;
+       thread_idx += blockDim.x * gridDim.x) {
+    // 当前是 batch 里的第几个 root
+    int32_t root_offset = thread_idx / coord_dim;
+    // 这个 root 的第几个坐标/特征维度
+    int32_t feat_offset = thread_idx % coord_dim;
+    // root_local_offsets:batch中的第 i 个 root节点 -> 它在当前本地 shard 中的 local offset
+    int32_t local_offset = root_local_offsets[root_offset];
+    if (local_offset >= 0) {
+      // 新节点特征更新在shard中
+      local_coordinate_shard[int64_t(local_offset) * coord_dim + feat_offset] =
+          updated_coords[int64_t(root_offset) * coord_dim + feat_offset];
+    }
+  }
+}
 
 std::vector<torch::Tensor> cuda_get_next(
     int32_t* ids,
-    float* float_features, 
+    float* float_features,
     int32_t* labels,
     int feature_dim,
     int32_t* agg_src,
@@ -201,21 +262,18 @@ std::vector<torch::Tensor> cuda_get_next(
       ids,
       {(long long)h_node_counter[INTRABATCH_CON * 3 + hop_num]},
       torch::TensorOptions().dtype(torch::kI32).device(device));
-
     ret.push_back(ids_tensor);
 
     torch::Tensor feature_tensor = torch::from_blob(
       float_features,
       {(long long)(h_node_counter[INTRABATCH_CON * 3 + hop_num]), (long long)(feature_dim)},
       torch::TensorOptions().dtype(torch::kF32).device(device));
-
     ret.push_back(feature_tensor);
 
     torch::Tensor labels_tensor = torch::from_blob(
       labels,
       {(long long)h_node_counter[INTRABATCH_CON * 3]},
-      torch::TensorOptions().dtype(torch::kI32).device(device));   
-
+      torch::TensorOptions().dtype(torch::kI32).device(device));
     ret.push_back(labels_tensor);
 
     for(int i = hop_num; i > 0; i--){
@@ -232,4 +290,24 @@ std::vector<torch::Tensor> cuda_get_next(
     }
 
     return ret;
+}
+
+void cuda_update_coordinates(
+    int32_t* root_local_offsets,
+    float* updated_coords,
+    int32_t root_count,
+    int32_t coord_dim,
+    float* local_coordinate_shard) {
+    if (root_count <= 0 || coord_dim <= 0 || local_coordinate_shard == nullptr) {
+      return;
+    }
+    dim3 block_num(32, 1);
+    dim3 thread_num(256, 1);
+    update_local_coordinate_shard_kernel<<<block_num, thread_num>>>(
+        root_local_offsets,
+        updated_coords,
+        root_count,
+        coord_dim,
+        local_coordinate_shard);
+    cudaCheckError();
 }

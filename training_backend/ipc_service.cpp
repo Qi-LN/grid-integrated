@@ -34,7 +34,12 @@ std::vector<torch::Tensor> cuda_get_next(
     int32_t* h_edge_counter
     );
 
-// C++ interface
+void cuda_update_coordinates(
+    int32_t* root_local_offsets,
+    float* updated_coords,
+    int32_t root_count,
+    int32_t coord_dim,
+    float* local_coordinate_shard);
 
 #define CHECK_CUDA(x) TORCH_CHECK(x.device().is_cuda(), #x " must be a CUDA tensor")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
@@ -66,15 +71,6 @@ std::vector<int> get_block_size() {
         ret.push_back(h_node_counter[INTRABATCH_CON * 3 + i]);
         ret.push_back(h_node_counter[INTRABATCH_CON * 3 + i - 1]);
     }
-    // int block1_src_node = h_node_counter[9];
-    // int block1_dst_node = h_node_counter[7];
-    // int block2_src_node = h_node_counter[7];
-    // int block2_dst_node = h_node_counter[5];
-
-    // ret.push_back(block1_src_node);
-    // ret.push_back(block1_dst_node);
-    // ret.push_back(block2_src_node);
-    // ret.push_back(block2_dst_node);
     return ret;
 }
 
@@ -90,6 +86,23 @@ void Synchronize(){
     env->Post();
 }
 
+void update_coordinates(torch::Tensor root_local_offsets, torch::Tensor updated_coords) {
+    CHECK_INPUT(root_local_offsets);
+    CHECK_INPUT(updated_coords);
+    float* local_coordinate_shard = env->GetLocalCoordinateShard();
+    if (local_coordinate_shard == nullptr) {
+        return;
+    }
+    int32_t root_count = root_local_offsets.size(0);
+    int32_t coord_dim = updated_coords.size(1);
+    cuda_update_coordinates(
+        root_local_offsets.data_ptr<int32_t>(),
+        updated_coords.data_ptr<float>(),
+        root_count,
+        coord_dim,
+        local_coordinate_shard);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("get_next", &get_next, "dataset get next (CUDA)");
   m.def("get_block_size", &get_block_size, "get dgl block size(CUDA)");
@@ -97,4 +110,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("initialize", &InitializeIPC, "InitializeIPC (CUDA)");
   m.def("finalize", &FinalizeIPC, "FinalizeIPC (CUDA)");
   m.def("synchronize", &Synchronize, "synchronize (CUDA)");
+  m.def("update_coordinates", &update_coordinates, "update_coordinates (CUDA)");
 }

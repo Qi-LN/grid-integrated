@@ -13,6 +13,7 @@ public:
     virtual int32_t* GetTrainingSetIds(int32_t part_id) const = 0;
     virtual int32_t* GetValidationSetIds(int32_t part_id) const = 0;
     virtual int32_t* GetTestingSetIds(int32_t part_id) const = 0;
+    virtual int32_t* GetInferenceSetIds(int32_t part_id) const = 0;
 
     virtual int32_t* GetTrainingLabels(int32_t part_id) const = 0;
     virtual int32_t* GetValidationLabels(int32_t part_id) const = 0;
@@ -21,6 +22,7 @@ public:
     virtual int32_t TrainingSetSize(int32_t part_id) const = 0;
     virtual int32_t ValidationSetSize(int32_t part_id) const = 0;
     virtual int32_t TestingSetSize(int32_t part_id) const = 0;
+    virtual int32_t InferenceSetSize(int32_t part_id) const = 0;
 
     virtual int32_t TotalNodeNum() const = 0;
     virtual float* GetAllFloatFeature() const = 0;

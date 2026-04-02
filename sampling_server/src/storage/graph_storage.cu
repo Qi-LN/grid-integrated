@@ -15,6 +15,7 @@ public:
         node_num_ = info->total_num_nodes;
         edge_num_ = info->total_edge_num;
         cache_edge_num_ = info->cache_edge_num;
+        max_degree_ = info->max_degree;
 
         csr_node_index_.resize(partition_count_);
         csr_dst_node_ids_.resize(partition_count_);
@@ -151,6 +152,10 @@ public:
         return partition_offset_[part_id];
     }
 
+    int64_t MaxDegree() const override {
+        return max_degree_;
+    }
+
 private:
     std::vector<int64_t> src_size_;	
 	std::vector<int64_t> dst_size_;
@@ -158,6 +163,7 @@ private:
     int32_t node_num_;
     int64_t edge_num_;
     int64_t cache_edge_num_;
+    int64_t max_degree_;
 
 	//CSR graph, every partition has a ptr copy
     int32_t partition_count_;

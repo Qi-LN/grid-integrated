@@ -6,6 +6,7 @@
 class IPCEnv {
 public:
   virtual void Coordinate(BuildInfo* info) = 0;
+  virtual void PublishCoordinateShards(class UnifiedCache* cache) = 0;
   virtual int32_t GetMaxStep() = 0;
 
   virtual void InitializeSamplesBuffer(int32_t batch_size, int32_t num_ids, int32_t feature_dim, int32_t device_id, int32_t pipeline_depth) = 0;
@@ -29,6 +30,7 @@ public:
 
   virtual void Finalize() = 0;
   virtual int32_t GetTrainStep() = 0;
+  virtual int32_t GetServeMode() = 0;
 
 };
  

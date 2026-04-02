@@ -21,6 +21,7 @@ public:
     virtual int64_t Dst_Size(int32_t part_id) const = 0;
     virtual char* PartitionIndex(int32_t part_id) const = 0;
     virtual int32_t* PartitionOffset(int32_t part_id) const = 0;
+    virtual int64_t MaxDegree() const = 0;
 };
 extern "C" 
 GraphStorage* NewCompleteGraphStorage();

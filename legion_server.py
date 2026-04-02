@@ -91,8 +91,25 @@ def Run(args):
         exit
     
 
+    serve_mode = 1 if args.mode == "infer" else 0
+    rootset_path = args.rootset_path if args.rootset_path else "-"
     with open("meta_config","w") as file:
-        file.write("{} {} {} {} {} {} {} {} {} {}".format(path, args.train_batch_size, vertices_num, edges_num, features_dim, train_set_num, valid_set_num, test_set_num, args.cache_memory, args.epoch))
+        file.write(
+            "{} {} {} {} {} {} {} {} {} {} {} {}".format(
+                path,
+                args.train_batch_size,
+                vertices_num,
+                edges_num,
+                features_dim,
+                train_set_num,
+                valid_set_num,
+                test_set_num,
+                args.cache_memory,
+                args.epoch,
+                serve_mode,
+                rootset_path,
+            )
+        )
 
     gpu_number = args.gpu_number
     
@@ -129,6 +146,8 @@ if __name__ == "__main__":
     argparser.add_argument('--epoch', type=int, default=2)
     argparser.add_argument('--cache_memory', type=int, default=38000000)
     argparser.add_argument('--usenvlink', type=int, default=1)
+    argparser.add_argument('--mode', type=str, choices=['train', 'infer'], default='train')
+    argparser.add_argument('--rootset_path', type=str, default='')
     args = argparser.parse_args()
 
     Run(args)

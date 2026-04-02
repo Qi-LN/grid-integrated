@@ -52,6 +52,10 @@
 #define TRAINMODE 0
 #define VALIDMODE 1
 #define TESTMODE  2
+#define INFERMODE 3
+
+#define SERVE_TRAIN 0
+#define SERVE_INFER 1
 
 #define CACHEMISS_FLAG -2
 #define CACHECPU_FLAG -1

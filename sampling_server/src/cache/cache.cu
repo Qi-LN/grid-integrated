@@ -317,7 +317,122 @@ void UnifiedCache::Initialize(
     float_feature_len_ = float_feature_len;
     cpu_cache_capacity_ = cpu_cache_capacity;
     gpu_cache_capacity_ = gpu_cache_capacity;
+    // 这三个变量都和 infer 模式下的 “coordinate store / shard 查找” 有关
+    coordinate_store_enabled_ = false;     // 开关，表示当前 UnifiedCache 是否启用了 coordinate store
+    host_root_positions_ = nullptr;    // host 侧的映射表，大小是 total_num_nodes_。global node id -> 这个 root/节点在全局拼接后的 coordinate store 里的位置 gidx
+    root_positions_ = nullptr;      // host_root_positions_ 的 device 可访问指针版本
     is_presc_ = true;
+}
+
+// 在 infer 模式下，把需要更新的节点特征按 shard 组织到多张 GPU 上，并建立从 global_id 到 shard 内位置的映射表
+void UnifiedCache::InitializeCoordinateStore(FeatureStorage* feature) {
+    total_num_nodes_ = feature->TotalNodeNum();
+    cpu_float_features_ = feature->GetAllFloatFeature();
+    coordinate_store_enabled_ = true;
+
+    // 存储shard显存指针
+    coordinate_shards_.assign(device_count_, nullptr);    // 重整长度和值
+    // 存储
+    coordinate_starts_.assign(device_count_, 0);
+    coordinate_sizes_.assign(device_count_, 0);
+    d_coordinate_shard_ptrs_.resize(device_count_);
+    d_coordinate_shard_offsets_.resize(device_count_);
+
+    // global id -> 这个 root节点在全局拼接后的 coordinate store 里的位置 gidx
+    cudaHostAlloc(&host_root_positions_, int64_t(total_num_nodes_) * sizeof(int32_t), cudaHostAllocMapped);
+    cudaCheckError();
+    // 初始化为-1，在把 每个gpu的 infer root 装进 shard 时，才写入真正位置
+    std::fill(host_root_positions_, host_root_positions_ + total_num_nodes_, -1);
+    // host_root_positions_ 的 device 可访问指针版本
+    cudaHostGetDevicePointer(&root_positions_, host_root_positions_, 0);
+    cudaCheckError();
+
+    std::vector<float*> host_shard_ptrs(device_count_, nullptr);
+    // 记录每个 shard 在“全局拼接后的 unified 空间”里的起始偏移
+    std::vector<int64_t> host_shard_offsets(device_count_ + 1, 0);
+    int64_t global_root_offset = 0;
+
+    dim3 block_num(32, 1);
+    dim3 thread_num(256, 1);
+
+    for (int32_t dev_id = 0; dev_id < device_count_; ++dev_id) {
+        cudaSetDevice(dev_id);
+        int64_t shard_size = feature->InferenceSetSize(dev_id);
+        // 当前shard在unified空间上的起始base地址
+        coordinate_starts_[dev_id] = global_root_offset;
+        // 每个shard的大小
+        coordinate_sizes_[dev_id] = shard_size;
+        // 每个shard在unified空间上的结束地址（不包含）
+        host_shard_offsets[dev_id] = global_root_offset;
+
+        float* shard_ptr = nullptr;
+        if (shard_size > 0) {
+            std::vector<int32_t> shard_ids(shard_size);
+            // 把这个 shard 对应的 root 节点 GID 拿到 shard_ids(host) 上
+            cudaMemcpy(
+                shard_ids.data(),
+                feature->GetInferenceSetIds(dev_id),
+                shard_size * sizeof(int32_t),
+                cudaMemcpyDeviceToHost);
+            cudaCheckError();
+
+            //  建立 global_id -> 全局拼接位置 映射
+            for (int64_t local_id = 0; local_id < shard_size; ++local_id) {
+                int32_t node_id = shard_ids[local_id];
+                if (node_id >= 0 && node_id < total_num_nodes_) {
+                    // host端gid->unified空间索引
+                    host_root_positions_[node_id] = static_cast<int32_t>(global_root_offset + local_id);
+                }
+            }
+
+            int32_t* shard_ids_dev = nullptr;
+            // 为当前 shard 分配真正存特征的 GPU 内存 | size=[shard_size, float_feature_len_]
+            cudaMalloc(&shard_ptr, int64_t(shard_size) * float_feature_len_ * sizeof(float));
+            // 把 shard_ids 再拷回 GPU
+            cudaMalloc(&shard_ids_dev, shard_size * sizeof(int32_t));
+            cudaMemcpy(shard_ids_dev, shard_ids.data(), shard_size * sizeof(int32_t), cudaMemcpyHostToDevice);
+            
+            //  将节点特征全部填充在shard中，构建unified shard
+            gather_coordinate_shard<<<block_num, thread_num>>>(
+                cpu_float_features_,
+                float_feature_len_,
+                shard_ids_dev,
+                shard_size,
+                shard_ptr);
+            cudaCheckError();
+            cudaFree(shard_ids_dev);
+        }
+
+        // cache内变量，存储每个shard显存指针
+        coordinate_shards_[dev_id] = shard_ptr;
+        // 临时变量，为了复制到每个GPU
+        host_shard_ptrs[dev_id] = shard_ptr;
+        // 记录前面shard的累计偏移量，即当前shard的起始base
+        global_root_offset += shard_size;
+        // 临时变量
+        host_shard_offsets[dev_id + 1] = global_root_offset;
+    }
+
+    // 把“所有 coordinate shard 的地址表”和“所有 shard 的偏移表”复制到每个 GPU 上，后续每个GPU都能 global_id -> shard -> local_id 的映射
+    for (int32_t dev_id = 0; dev_id < device_count_; ++dev_id) {
+        cudaSetDevice(dev_id);
+        // 临时变量，复制到每个GPU上
+        float** shard_ptrs = nullptr;
+        int64_t* shard_offsets = nullptr;
+        cudaMalloc(&shard_ptrs, device_count_ * sizeof(float*));
+        cudaMalloc(&shard_offsets, (device_count_ + 1) * sizeof(int64_t));
+        cudaMemcpy(shard_ptrs, host_shard_ptrs.data(), device_count_ * sizeof(float*), cudaMemcpyHostToDevice);
+        cudaMemcpy(shard_offsets, host_shard_offsets.data(), (device_count_ + 1) * sizeof(int64_t), cudaMemcpyHostToDevice);
+        cudaCheckError();
+        // 真正管理指针的数组
+        d_coordinate_shard_ptrs_[dev_id] = shard_ptrs;
+        d_coordinate_shard_offsets_[dev_id] = shard_offsets;
+    }
+
+    if (global_root_offset != total_num_nodes_) {
+        std::cout<<"Warning: coordinate roots "<<global_root_offset<<" != total nodes "<<total_num_nodes_<<"\n";
+    }
+    cudaDeviceSynchronize();
 }
 
 void UnifiedCache::InitializeCacheController(
@@ -692,6 +807,9 @@ float** UnifiedCache::Global_Float_Feature_Cache(int32_t dev_id)
 }
 
 int32_t UnifiedCache::MaxIdNum(int32_t dev_id){
+    if (coordinate_store_enabled_) {
+        return static_cast<int32_t>(coordinate_sizes_[dev_id] + 1);
+    }
     return cache_controller_[dev_id]->MaxIdNum();
 }
 
@@ -745,4 +863,47 @@ void UnifiedCache::FeatCacheLookup(int32_t* sampled_ids, int32_t* cache_index,
         total_num_nodes_,
         dev_id, op_id
     );
+}
+
+void UnifiedCache::InferFeatLookup(
+    int32_t* sampled_ids,
+    int32_t* node_counter,
+    float* dst_float_buffer,
+    int32_t op_id,
+    int32_t dev_id,
+    cudaStream_t strm_hdl) {
+    dim3 block_num(32, 1);
+    dim3 thread_num(1024, 1);
+    coord_shard_lookup<<<block_num, thread_num, 0, strm_hdl>>>(
+        d_coordinate_shard_ptrs_[dev_id],
+        d_coordinate_shard_offsets_[dev_id],
+        device_count_,
+        root_positions_,
+        float_feature_len_,
+        sampled_ids,
+        node_counter,
+        dst_float_buffer,
+        op_id);
+    cudaCheckError();
+}
+
+// 返回vector长度
+int32_t UnifiedCache::CoordinateShardCount() const {
+    return coordinate_shards_.size();
+}
+
+int64_t UnifiedCache::CoordinateShardStart(int32_t shard_id) const {
+    return coordinate_starts_[shard_id];
+}
+
+int64_t UnifiedCache::CoordinateShardSize(int32_t shard_id) const {
+    return coordinate_sizes_[shard_id];
+}
+
+void* UnifiedCache::CoordinateShardPtr(int32_t shard_id) const {
+    return coordinate_shards_[shard_id];
+}
+
+bool UnifiedCache::IsCoordinateStoreEnabled() const {
+    return coordinate_store_enabled_;
 }

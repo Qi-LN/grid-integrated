@@ -72,6 +72,8 @@ public:
         int32_t device_count,    
         int32_t cpu_cache_capacity,
         int32_t gpu_cache_capacity);
+
+    void InitializeCoordinateStore(FeatureStorage* feature);
     
     void InitializeCacheController(
         int32_t dev_id, 
@@ -79,7 +81,6 @@ public:
 
     void Finalize(int32_t dev_id);
 
-    //these api will change, find, update, clear
     void FindFeat(
         int32_t* sampled_ids, 
         int32_t* cache_offset, 
@@ -130,6 +131,19 @@ public:
                          int32_t* node_counter, float* dst_float_buffer,
                          int32_t op_id, int32_t dev_id, cudaStream_t strm_hdl);
 
+    void InferFeatLookup(int32_t* sampled_ids,
+                         int32_t* node_counter,
+                         float* dst_float_buffer,
+                         int32_t op_id,
+                         int32_t dev_id,
+                         cudaStream_t strm_hdl);
+
+    int32_t CoordinateShardCount() const;
+    int64_t CoordinateShardStart(int32_t shard_id) const;
+    int64_t CoordinateShardSize(int32_t shard_id) const;
+    void* CoordinateShardPtr(int32_t shard_id) const;
+    bool IsCoordinateStoreEnabled() const;
+
 private:    
     int32_t NodeCapacity(int32_t dev_id);
 
@@ -137,11 +151,11 @@ private:
     
     int32_t GPUCapacity();
 
-    float* Float_Feature_Cache(int32_t dev_id);//return all features
+    float* Float_Feature_Cache(int32_t dev_id);
     
     float** Global_Float_Feature_Cache(int32_t dev_id);
 
-    std::vector<bool> dev_ids_;/*valid device, indexed by device id, False means invalid, True means valid*/
+    std::vector<bool> dev_ids_;
     
     int32_t device_count_;
 
@@ -159,8 +173,8 @@ private:
     std::vector<int32_t> node_capacity_;
     std::vector<int32_t> edge_capacity_;
 
-    int32_t cpu_cache_capacity_;//for legion ssd
-    int32_t gpu_cache_capacity_;//for legion ssd
+    int32_t cpu_cache_capacity_;
+    int32_t gpu_cache_capacity_;
 
     int64_t cache_memory_;
     std::vector<int32_t> sidx_;
@@ -171,11 +185,17 @@ private:
 
     int32_t float_feature_len_;
     int32_t total_num_nodes_;
-    float*  cpu_float_features_;
+    float* cpu_float_features_;
+    bool coordinate_store_enabled_;
+    std::vector<float*> coordinate_shards_;
+    std::vector<int64_t> coordinate_starts_;
+    std::vector<int64_t> coordinate_sizes_;
+    std::vector<float**> d_coordinate_shard_ptrs_;
+    std::vector<int64_t*> d_coordinate_shard_offsets_;
+    int32_t* host_root_positions_;
+    int32_t* root_positions_;
 
     bool is_presc_;
 };
-
-
 
 #endif

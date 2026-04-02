@@ -1,6 +1,21 @@
 #include "storage_management.cuh"
 #include "storage_management_impl.cuh"
 
+namespace {
+
+int32_t resolve_owner_by_position(int64_t position, int32_t shard_count, int64_t total_count) {
+    if (position < 0 || position >= total_count || shard_count <= 0 || total_count <= 0) {
+        return -1;
+    }
+    int64_t owner = (position * shard_count) / total_count;
+    if (owner >= shard_count) {
+        owner = shard_count - 1;
+    }
+    return static_cast<int32_t>(owner);
+}
+
+}
+
 
 void StorageManagement::EnableP2PAccess(){
     int32_t device_count = -1;
@@ -59,6 +74,18 @@ void StorageManagement::ReadMetaFIle(BuildInfo* info){
         iss >> epoch_;
         std::cout<<"Train epoch:        "<<epoch_<<"\n";
         info->epoch = epoch_;
+        if (iss >> serve_mode_) {
+            std::cout<<"Serve mode:         "<<serve_mode_<<"\n";
+        } else {
+            serve_mode_ = SERVE_TRAIN;
+            iss.clear();
+        }
+        if (iss >> rootset_path_) {
+            std::cout<<"Rootset path:       "<<rootset_path_<<"\n";
+        } else {
+            rootset_path_ = "-";
+            iss.clear();
+        }
     }else{
         iss >> dataset_path_;
         std::cout<<"Dataset path:       "<<dataset_path_<<"\n";
@@ -82,6 +109,18 @@ void StorageManagement::ReadMetaFIle(BuildInfo* info){
         iss >> epoch_;
         std::cout<<"Train epoch:        "<<epoch_<<"\n";
         info->epoch = epoch_;
+        if (iss >> serve_mode_) {
+            std::cout<<"Serve mode:         "<<serve_mode_<<"\n";
+        } else {
+            serve_mode_ = SERVE_TRAIN;
+            iss.clear();
+        }
+        if (iss >> rootset_path_) {
+            std::cout<<"Rootset path:       "<<rootset_path_<<"\n";
+        } else {
+            rootset_path_ = "-";
+            iss.clear();
+        }
         iss >> partition_;
         std::cout<<"Partition?:         "<<partition_<<"\n";
         iss >> num_ssd_;
@@ -93,7 +132,8 @@ void StorageManagement::ReadMetaFIle(BuildInfo* info){
         iss >> gpu_cache_capacity_;
         std::cout<<"GPU Cache Capacity: "<<gpu_cache_capacity_<<"\n";
     }
-    
+    info->serve_mode = serve_mode_;
+    info->rootset_path = rootset_path_;
 
 }
 
@@ -112,6 +152,17 @@ void StorageManagement::LoadGraph(BuildInfo* info){
 
     mmap_indptr_read(edge_src_path, info->csr_node_index);
     mmap_indices_read(edge_dst_path, info->csr_dst_node_ids);
+
+    // compute max degree for buffer allocation
+    max_degree_ = 0;
+    for (int32_t node_id = 0; node_id < node_num; ++node_id) {
+        int64_t degree = info->csr_node_index[node_id + 1] - info->csr_node_index[node_id];
+        if (degree > max_degree_) {
+            max_degree_ = degree;
+        }
+    }
+    info->max_degree = max_degree_;
+    std::cout<<"Max degree:         "<<max_degree_<<"\n";
 }
 
 
@@ -130,6 +181,7 @@ void StorageManagement::LoadFeature(BuildInfo* info){
     (info->validation_labels).resize(partition_count);
     (info->testing_set_ids).resize(partition_count);
     (info->testing_labels).resize(partition_count);
+    (info->inference_set_ids).resize(partition_count);
 
     std::string training_path = dataset_path_  + "trainingset";
     std::string validation_path = dataset_path_  + "validationset";
@@ -166,7 +218,9 @@ void StorageManagement::LoadFeature(BuildInfo* info){
     int32_t fdret = mmap_partition_read(partition_path, partition_index);
 
     std::cout<<"Finish Reading All Files\n";
-    // partition nodes
+
+    // partition nodes，把顶点分配到每个gpu内的集合中。
+    // training_ids->info->training_set_ids
 
     int trainingset_count = 0;
     for(int32_t i = 0; i < training_set_num_; i+=1){
@@ -196,7 +250,7 @@ void StorageManagement::LoadFeature(BuildInfo* info){
     for(int32_t i = 0; i < testing_set_num_; i++){
         int32_t tid = testing_ids[i];
         int32_t part_id = tid % partition_count;
-        
+
         if(part_id < partition_count){
             (info->testing_set_ids[part_id]).push_back(tid);
         }
@@ -229,6 +283,38 @@ void StorageManagement::LoadFeature(BuildInfo* info){
     info->host_float_feature = host_float_feature;
     info->float_feature_len = float_feature_len_;
     info->total_num_nodes = node_num_;
+
+    // partition inference root. 文件->info->inference_set_ids. TODO:修改为按GPU加载
+    if (serve_mode_ == SERVE_INFER && rootset_path_ != "-" && !rootset_path_.empty()) {
+        int32_t root_fd = open(rootset_path_.c_str(), O_RDONLY);
+        if (root_fd == -1) {
+            std::cout<<"cannout open file: "<<rootset_path_<<"\n";
+        } else {
+            int64_t root_buf_len = lseek(root_fd, 0, SEEK_END);
+            const int32_t* root_buf = (int32_t*)mmap(NULL, root_buf_len, PROT_READ, MAP_PRIVATE, root_fd, 0);
+            const int32_t* root_end = root_buf + root_buf_len / sizeof(int32_t);
+            int64_t root_total = root_buf_len / sizeof(int32_t);
+            int64_t root_count = 0;
+            int64_t root_position = 0;
+            while (root_buf < root_end) {
+                int32_t root_id = *root_buf++;
+                int32_t owner = resolve_owner_by_position(root_position, partition_count, root_total);
+                if (root_id >= 0 && root_id < node_num_ && owner >= 0 && owner < partition_count) {
+                    info->inference_set_ids[owner].push_back(root_id);
+                    root_count++;
+                }
+                root_position++;
+            }
+            close(root_fd);
+            std::cout<<"Inference roots:    "<<root_count<<"\n";
+            if (root_total != node_num_) {
+                std::cout<<"Warning: root file count "<<root_total<<" != node count "<<node_num_<<"\n";
+            }
+        }
+    }
+    for (int32_t part_id = 0; part_id < partition_count; ++part_id) {
+        info->inference_set_num.push_back(info->inference_set_ids[part_id].size());
+    }
 }
 
 void StorageManagement::Initialze(int32_t partition_count, int32_t in_memory_mode){
@@ -238,7 +324,7 @@ void StorageManagement::Initialze(int32_t partition_count, int32_t in_memory_mod
     BuildInfo* info = new BuildInfo();
 
     EnableP2PAccess();
-    
+
     ConfigPartition(info, partition_count);
 
     ReadMetaFIle(info);
@@ -251,7 +337,7 @@ void StorageManagement::Initialze(int32_t partition_count, int32_t in_memory_mod
     env_ -> Coordinate(info);
 
     feature_ = NewCompleteFeatureStorage();
-    feature_ -> Build(info, in_memory_mode_);   
+    feature_ -> Build(info, in_memory_mode_);
 
     graph_ = NewCompleteGraphStorage();
     graph_ -> Build(info);
@@ -264,6 +350,11 @@ void StorageManagement::Initialze(int32_t partition_count, int32_t in_memory_mod
 
     cudaSetDevice(0);
     cache_ -> Initialize(cache_memory_, float_feature_len_, train_step, partition_count, cpu_cache_capacity_, gpu_cache_capacity_);
+    if (serve_mode_ == SERVE_INFER) {
+        // 1. 构建unified shard + 映射表  2. 把每个GPU上对应的coordinate shard的起始global id和size发布到IPCEnv里
+        cache_->InitializeCoordinateStore(feature_);
+        env_->PublishCoordinateShards(cache_);
+    }
     cudaSetDevice(0);
     std::cout<<"Storage Initialized\n";
 }

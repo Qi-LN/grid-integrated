@@ -46,12 +46,15 @@ private:
   int32_t testing_set_num_;
 
   int32_t float_feature_len_;
+  int64_t max_degree_;
 
   int64_t cache_memory_;
 
   std::string dataset_path_;
+  std::string rootset_path_;
   int32_t raw_batch_size_;
   int32_t epoch_;
+  int32_t serve_mode_;
   int32_t num_ssd_;
   int32_t num_queues_per_ssd_;
   int32_t cpu_cache_capacity_;//for Helios
@@ -62,5 +65,4 @@ private:
   UnifiedCache* cache_;
   IPCEnv* env_;
 };
-
 

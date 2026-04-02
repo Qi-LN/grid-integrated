@@ -10,6 +10,7 @@
 // #include "monitor.cuh"
 #include "system_config.cuh"
 
+#include <algorithm>
 #include <thread>
 #include <functional>
 #include <chrono>
@@ -54,6 +55,8 @@ public:
         // monitor_ = new PCM_Monitor();
         // monitor_->Init();
         
+        // 初始化整个服务
+        // 调用 StorageManagement 把图、特征、缓存、IPC 都准备好，然后为每张 GPU 创建对应的 Runner 和运行参数。
         StorageManagement* storage_management = new StorageManagement();
         storage_management->Initialze(shard_count_, in_memory_mode);
         graph_              = storage_management->GetGraph();
@@ -63,6 +66,7 @@ public:
 
         train_step_         = ipc_env_->GetTrainStep();
         max_step_           = ipc_env_->GetMaxStep();
+        serve_mode_         = ipc_env_->GetServeMode();
 
         runners_.resize(shard_count_);
         params_.resize(shard_count_);
@@ -88,6 +92,15 @@ public:
     }
 
     void PreSc(int cache_agg_mode) {
+        if (serve_mode_ == SERVE_INFER) {
+            for(int i = 0; i < shard_count_; i++){
+                runners_[i]->InitializeFeaturesBuffer(params_[i]);
+            }
+            std::cout<<"Infer mode ready for serving\n";
+            // infer模式不需要预处理，直接把特征加载到GPU里就可以了。
+            return;
+            // 后续的CandidateSelection，CostModel，FillUp等步骤都不做了
+        }
         // std::cout<<"Start Pre-sampling"<<std::endl;
         // monitor_->Start();
         std::chrono::steady_clock::time_point t1 = std::chrono::steady_clock::now();
@@ -156,6 +169,7 @@ private:
     int shard_count_;
     int train_step_;
     int max_step_;
+    int serve_mode_;
 
     std::vector<std::thread> presc_thread_pool_;
     std::vector<std::thread> train_thread_pool_;
@@ -188,10 +202,17 @@ public:
         int max_ids_num         = batch_size;
         std::vector<int32_t> max_num_per_hop;
         int hop_num             = (params->fanout).size();
-        max_num_per_hop.resize(hop_num);
-        max_num_per_hop[0]      = batch_size * (params->fanout)[0];
-        for(int i = 1; i < hop_num; i++){
-            max_num_per_hop[i]  = max_num_per_hop[i - 1] * (params->fanout)[i];
+        if (env->GetServeMode() == SERVE_INFER) {
+            hop_num = 1;
+            max_num_per_hop.resize(1);
+            // 预先分配出大致的采样空间
+            max_num_per_hop[0] = batch_size * std::max<int64_t>(1, graph->MaxDegree());
+        } else {
+            max_num_per_hop.resize(hop_num);
+            max_num_per_hop[0]      = batch_size * (params->fanout)[0];
+            for(int i = 1; i < hop_num; i++){
+                max_num_per_hop[i]  = max_num_per_hop[i - 1] * (params->fanout)[i];
+            }
         }
         for(int i = 0; i < hop_num; i++){
             max_ids_num += max_num_per_hop[i];
@@ -267,15 +288,21 @@ public:
             op_params_[i]->hop_num      = hop_num;
         }
 
+        // 给每一跳对应的采样算子设置“这一跳要采多少个邻居”。 infer 模式下设成 0 就行了，因为后续的采样算子会根据实际的邻居数来采样，不需要事先设定一个 fanout 上限。 train 模式下则按照用户设定的 fanout 来设置。
         for(int i = 0; i < hop_num; i++){
-            op_params_[INTRABATCH_CON * i + INTRABATCH_CON]->neighbor_count = (params->fanout)[i];
+            op_params_[INTRABATCH_CON * i + INTRABATCH_CON]->neighbor_count =
+                env->GetServeMode() == SERVE_INFER ? 0 : (params->fanout)[i];
         }
     }
 
     void InitializeFeaturesBuffer(RunnerParams* params) override {
         UnifiedCache* cache     = (UnifiedCache*)(params->cache);
-        int32_t num_ids         = int32_t((cache->MaxIdNum(local_dev_id_)) * 1.2);
         IPCEnv* env             = (IPCEnv*)(params->env);
+        // 计算这张卡所需的feature buffer大小
+        // infer 模式，按前面估算好的 num_ids_ 来分配。train 模式，按 cache 里可能涉及的最大节点数乘一个 1.2 的冗余系数来分配
+        int32_t num_ids         = env->GetServeMode() == SERVE_INFER
+                                  ? num_ids_
+                                  : int32_t((cache->MaxIdNum(local_dev_id_)) * 1.2);
         env->InitializeFeaturesBuffer(0, num_ids, float_feature_len_, local_dev_id_, interbatch_concurrency_);
         for(int i = 0; i < interbatch_concurrency_; i++){
           memorypool_->SetFloatFeatures(env->GetFloatFeatures(local_dev_id_, i), i);
@@ -367,4 +394,3 @@ private:
 Runner* NewGPURunner(){
     return new GPURunner();
 }
-

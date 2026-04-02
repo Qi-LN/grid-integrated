@@ -3,6 +3,7 @@
 #include "system_config.cuh"
 
 #include <cuda_runtime.h>
+#include <algorithm>
 #include <iostream>
 #include <random>
 
@@ -25,23 +26,23 @@
 
 //assume no duplicate
 __global__ void batch_generate(
-	int32_t* batch_ids, 
-	int32_t* labels, 
-	int32_t batch_size, 
-	int32_t counter, 
-	int32_t* all_ids, 
-	int32_t* all_labels, 
+	int32_t* batch_ids,
+	int32_t* labels,
+	int32_t batch_size,
+	int32_t start_idx,
+	int32_t* all_ids,
+	int32_t* all_labels,
 	int32_t total_cap,
 	int32_t* position_map,
 	uint32_t* accessed_map)
 {
 	int32_t idx = threadIdx.x + blockDim.x * blockIdx.x;
 	if(idx < batch_size){
-		if((batch_size * counter + idx) >= total_cap){
+		if((start_idx + idx) >= total_cap){
 			batch_ids[idx] = -1;
 			labels[idx] = -1;
 		}else{
-			int32_t src_id = all_ids[(batch_size * counter + idx)%(total_cap)];
+			int32_t src_id = all_ids[start_idx + idx];
 			batch_ids[idx] = src_id;
 			// accessed_map[src_id] = 1;
 			int32_t bitmap_idx = src_id / 32;
@@ -49,15 +50,17 @@ __global__ void batch_generate(
 			uint32_t bitmap_data = (1 << bitmap_off);
 			atomicOr(accessed_map + bitmap_idx, bitmap_data);
 			position_map[src_id] = idx;
-			labels[idx] = all_labels[(batch_size * counter + idx)%(total_cap)];
-		}	
+			// 推理路径里 labels 复用成当前 root 在本 shard 内的 local offset。
+			// infer阶段写“位置索引”，训练阶段写“真实标签”
+			labels[idx] = all_labels == nullptr ? (start_idx + idx) : all_labels[start_idx + idx];
+		}
 	}
 }
 
 __global__ void counter_update(
 	int32_t* node_counter, 			// for the inputs of feature extraction and graph sampling
 	int32_t* edge_counter, 			// for the inputs of graph sampling
-	int32_t op_id, 
+	int32_t op_id,
 	int32_t size,
 	int32_t hop_num)
 {
@@ -67,8 +70,8 @@ __global__ void counter_update(
 		node_counter[INTRABATCH_CON * 3 + (op_id / INTRABATCH_CON)] = node_counter[0] + node_counter[1];
 		node_counter[INTRABATCH_CON * 3 - 1] = hop_num;
 	}else if((op_id > 0) && (op_id % INTRABATCH_CON == 0)){
-		node_counter[0] = node_counter[0] + node_counter[1];		
-		node_counter[1] = node_counter[INTRABATCH_CON * 2];			
+		node_counter[0] = node_counter[0] + node_counter[1];
+		node_counter[1] = node_counter[INTRABATCH_CON * 2];
 		node_counter[INTRABATCH_CON * 2] = 0;						//reset
 		node_counter[INTRABATCH_CON * 2 + 1] = node_counter[0] + node_counter[1];					//total
 		//hop1 start (0 C0), hop2 start (C0 C1), hop3 start (C0+C1 C2)
@@ -79,10 +82,10 @@ __global__ void counter_update(
 		//hop1 start (0 0 0), hop2 start (0 B1 0), hop3 start (B1 B2 0)
 		//hop1 done (0 B1 0), hop2 done (B1 B2 0), hop3 done (B1+B2 B3 0)
 		node_counter[INTRABATCH_CON * 3 + (op_id / INTRABATCH_CON)] = node_counter[0] + node_counter[1];
-		edge_counter[INTRABATCH_CON * 3 + (op_id / INTRABATCH_CON)] = edge_counter[0] + edge_counter[1];	
+		edge_counter[INTRABATCH_CON * 3 + (op_id / INTRABATCH_CON)] = edge_counter[0] + edge_counter[1];
 	}else if(op_id % INTRABATCH_CON > 0){
-		node_counter[(op_id % INTRABATCH_CON) * 2] = node_counter[0];										
-		node_counter[(op_id % INTRABATCH_CON) * 2 + 1] = node_counter[1];	
+		node_counter[(op_id % INTRABATCH_CON) * 2] = node_counter[0];
+		node_counter[(op_id % INTRABATCH_CON) * 2 + 1] = node_counter[1];
 	}else{
 		printf("Sampling Parameters Error\n");
 	}
@@ -90,12 +93,12 @@ __global__ void counter_update(
 
 extern "C"
 void BatchGenerate(
-	cudaStream_t    strm_hdl, 
+	cudaStream_t    strm_hdl,
 	FeatureStorage* feature,
 	UnifiedCache*   cache,
 	MemoryPool*     memorypool,
-	int32_t         batch_size, 
-	int32_t         counter, 
+	int32_t         batch_size,
+	int32_t         counter,
 	int32_t         part_id,
 	int32_t         dev_id,
 	int32_t         mode,
@@ -117,6 +120,9 @@ void BatchGenerate(
 		all_ids 	= feature->GetTestingSetIds(dev_id);
 		all_labels 	= feature->GetTestingLabels(dev_id);
 		total_cap 	= feature->TestingSetSize(dev_id);
+	}else if(mode == INFERMODE){
+		all_ids 	= feature->GetInferenceSetIds(dev_id);
+		total_cap 	= feature->InferenceSetSize(dev_id);
 	}else{
 		std::cout<<"invalid mode: "<<mode<<"\n";
 	}
@@ -142,7 +148,7 @@ void BatchGenerate(
 		std::cout<<"invalid src id ptr\n";
 		return;
 	}
-	if(all_labels == nullptr){
+	if(mode != INFERMODE && all_labels == nullptr){
 		std::cout<<"invalid label ptr\n";
 		return;
 	}
@@ -156,31 +162,84 @@ void BatchGenerate(
 	cudaMemsetAsync(edge_counter, 0, 16 * sizeof(int32_t), (strm_hdl));
 	cudaCheckError();
 
-	int32_t size = ((batch_size*(counter+1)) >= total_cap) ? (total_cap - batch_size * counter) : batch_size;
-	dim3 bg_block((size - 1)/OP_THREAD_NUM + 1, 1);
-	dim3 bg_thread(OP_THREAD_NUM, 1);
-	batch_generate<<<bg_block, bg_thread, 0, (strm_hdl)>>>(batch_ids, labels, size, counter, all_ids, all_labels, total_cap, position_map, accessed_map);
-	cudaCheckError();
-
+	int32_t start_idx = batch_size * counter;
+	int32_t size = 0;
+	if (start_idx < total_cap) {
+		// 计算真正要处理的size
+		size = std::min(batch_size, total_cap - start_idx);
+	}
+	if (size > 0) {
+		dim3 bg_block((size - 1)/OP_THREAD_NUM + 1, 1);
+		dim3 bg_thread(OP_THREAD_NUM, 1);
+		batch_generate<<<bg_block, bg_thread, 0, (strm_hdl)>>>(batch_ids, labels, size, start_idx, all_ids, all_labels, total_cap, position_map, accessed_map);
+		cudaCheckError();
+	}
 	counter_update<<<1, 1, 0, (strm_hdl)>>>(node_counter, edge_counter, 0, size, hop_num);
 	cudaCheckError();
-	if(!is_presc){
+	// infer模式不走这里
+	if(!is_presc && mode != INFERMODE){
 		cache->FindFeat(sampled_ids, cache_index, node_counter, op_id, strm_hdl, dev_id);
 		cudaCheckError();
 	}
 
 }
 
+__global__ void infer_full_neighbors(
+	int32_t* input_ids,
+	int32_t batch_size,
+	int64_t* csr_node_index,
+	int32_t* csr_dst_node_ids,
+	int32_t* sampled_ids,
+	int32_t* agg_src_ids,
+	int32_t* agg_dst_ids,
+	uint32_t* accessed_map,
+	int32_t* position_map,
+	int32_t* node_counter,
+	int32_t* edge_counter)
+{
+	for (int32_t idx = threadIdx.x + blockDim.x * blockIdx.x; idx < batch_size; idx += blockDim.x * gridDim.x) {
+		int32_t root_id = input_ids[idx];
+		if (root_id < 0) {
+			continue;
+		}
+		int64_t start_index = csr_node_index[root_id];
+		int64_t end_index = csr_node_index[root_id + 1];
+		for (int64_t edge_idx = start_index; edge_idx < end_index; ++edge_idx) {
+			int32_t nbr_id = csr_dst_node_ids[edge_idx];
+			int32_t bitmap_idx = nbr_id / 32;
+			int32_t bitmap_off = nbr_id % 32;
+			uint32_t bitmap_data = (1U << bitmap_off);
+			// 用位图判断这个邻居是不是第一次出现
+			uint32_t old_bitmap_data = atomicOr(accessed_map + bitmap_idx, bitmap_data);
+			// accessed_map 是一个 bitmap.0未访问，1已被取
+			uint32_t is_accessed = (old_bitmap_data >> bitmap_off) % 2;
+			if (is_accessed == 0) {
+				// 新邻居追加到sampled_ids
+				int32_t node_off = atomicAdd(node_counter + INTRABATCH_CON * 2, 1);
+				int32_t node_base = node_counter[0] + node_counter[1];
+				sampled_ids[node_base + node_off] = nbr_id;
+				// 记录这个全局节点 id 在局部 sampled 数组中的位置。因为计算时需要使用局部id
+				position_map[nbr_id] = node_base + node_off;
+			}
+			// 不管是不是新节点，都记录边
+			int32_t edge_off = atomicAdd(edge_counter + 2, 1);
+			int32_t edge_base = edge_counter[0] + edge_counter[1];
+			agg_src_ids[edge_base + edge_off] = nbr_id;
+			agg_dst_ids[edge_base + edge_off] = root_id;
+		}
+	}
+}
+
 /////////random sampler//////////
 __global__ void random_sample(
 	int32_t*  sampled_ids,
 	int32_t   op_id,
-	int64_t** csr_node_index, 
+	int64_t** csr_node_index,
 	int32_t** csr_dst_node_ids,
 	char*     partition_index,
 	int32_t*  parition_offset,
-	int32_t   count, 
-	int32_t   partition_count, 
+	int32_t   count,
+	int32_t   partition_count,
 	int32_t*  agg_src_ids,
 	int32_t*  agg_dst_ids,
 	uint32_t*  accessed_map,
@@ -189,7 +248,7 @@ __global__ void random_sample(
 	int32_t*  edge_counter,
 	int32_t   dev_id
 	)
-{	
+{
 	/*the direction for agg is reversed*/
 	__shared__ int32_t sh_agg_src_ids[SH_MEM_SIZE];
 	__shared__ int32_t sh_agg_dst_ids[SH_MEM_SIZE];
@@ -266,7 +325,7 @@ __global__ void random_sample(
         __syncthreads();
 		if(threadIdx.x < local_offset[0]){
 			int32_t node_base = local_offset[1] + node_counter[0] + node_counter[1];
-			int32_t dst_id = sh_sampled_id[threadIdx.x]; 
+			int32_t dst_id = sh_sampled_id[threadIdx.x];
 			sampled_ids[node_base + threadIdx.x] = dst_id;
 			position_map[dst_id] = node_base + threadIdx.x;
 		}
@@ -274,13 +333,13 @@ __global__ void random_sample(
 		if(threadIdx.x < local_offset[2]){
 			int32_t edge_base = local_offset[3] + edge_counter[0] + edge_counter[1];
 			agg_src_ids[edge_base + threadIdx.x] = sh_agg_src_ids[threadIdx.x];
-			agg_dst_ids[edge_base + threadIdx.x] = sh_agg_dst_ids[threadIdx.x]; 
+			agg_dst_ids[edge_base + threadIdx.x] = sh_agg_dst_ids[threadIdx.x];
 		}
 		__syncthreads();
 	}
 }
 
-__global__ void construct_graph(int32_t* agg_src_ids, int32_t* agg_dst_ids, 
+__global__ void construct_graph(int32_t* agg_src_ids, int32_t* agg_dst_ids,
 								int32_t* agg_src_off, int32_t* agg_dst_off,
 								int32_t* position_map, int32_t* edge_counter, int32_t* node_counter, int32_t op_id, int32_t dev_id){
 	int32_t edge_num = edge_counter[2];
@@ -301,12 +360,12 @@ __global__ void construct_graph(int32_t* agg_src_ids, int32_t* agg_dst_ids,
 __global__ void pre_sample(
 	int32_t*  sampled_ids,
 	int32_t   op_id,
-	int64_t* csr_node_index, 
+	int64_t* csr_node_index,
 	int32_t* csr_dst_node_ids,
 	char*     partition_index,
 	int32_t*  parition_offset,
-	int32_t   count, 
-	int32_t   partition_count, 
+	int32_t   count,
+	int32_t   partition_count,
 	int32_t*  agg_src_ids,
 	int32_t*  agg_dst_ids,
 	uint32_t*  accessed_map,
@@ -316,7 +375,7 @@ __global__ void pre_sample(
 	int32_t   dev_id,
 	unsigned long long int*  edge_access_time
 	)
-{	
+{
 	/*the direction for agg is reversed*/
 	__shared__ int32_t sh_agg_src_ids[SH_MEM_SIZE];
 	__shared__ int32_t sh_agg_dst_ids[SH_MEM_SIZE];
@@ -382,7 +441,7 @@ __global__ void pre_sample(
         __syncthreads();
 		if(threadIdx.x < local_offset[0]){
 			int32_t node_base = local_offset[1] + node_counter[0] + node_counter[1];
-			int32_t dst_id = sh_sampled_id[threadIdx.x]; 
+			int32_t dst_id = sh_sampled_id[threadIdx.x];
 			sampled_ids[node_base + threadIdx.x] = dst_id;
 			position_map[dst_id] = node_base + threadIdx.x;
 		}
@@ -390,24 +449,24 @@ __global__ void pre_sample(
 		if(threadIdx.x < local_offset[2]){
 			int32_t edge_base = local_offset[3] + edge_counter[0] + edge_counter[1];
 			agg_src_ids[edge_base + threadIdx.x] = sh_agg_src_ids[threadIdx.x];
-			agg_dst_ids[edge_base + threadIdx.x] = sh_agg_dst_ids[threadIdx.x]; 
+			agg_dst_ids[edge_base + threadIdx.x] = sh_agg_dst_ids[threadIdx.x];
 		}
 		__syncthreads();
 	}
 }
 
 
-extern "C"											
+extern "C"
 void RandomSample(
-  cudaStream_t    strm_hdl, 
+  cudaStream_t    strm_hdl,
   GraphStorage*   graph,
   UnifiedCache*   cache,
   MemoryPool*     memorypool,
   int32_t         count,
   int32_t         dev_id,
   int32_t         op_id,
-  bool            is_presc) 
-{		
+  bool            is_presc)
+{
 
 	if(graph == nullptr){
 		std::cout<<"invalid storage ptr\n";
@@ -432,9 +491,44 @@ void RandomSample(
 	char* tmp_partition_index  		= memorypool->GetTmpPartIdx();
 	int32_t* tmp_parition_offset	= memorypool->GetTmpPartOff();
 	int32_t* cache_index 			= memorypool->GetCacheSearchBuffer();
+	int32_t mode 					= memorypool->GetCurrentMode();
 
     dim3 block_num(16, 1);
     dim3 thread_num(OP_THREAD_NUM, 1);
+	if (mode == INFERMODE) {
+		int32_t* h_node_counter = (int32_t*)malloc(16 * sizeof(int32_t));
+		cudaMemcpy(h_node_counter, node_counter, 64, cudaMemcpyDeviceToHost);
+		cudaCheckError();
+		// 取出当前 batch 的 root 数量
+		int32_t batch_size = h_node_counter[1];
+		int64_t* pin_csr_node_index = graph->GetCSRNodeIndexCPU();
+		int32_t* pin_csr_dst_node_ids = graph->GetCSRNodeMatrixCPU();
+		// 如果batch非空，就取一跳全邻居
+		if (batch_size > 0) {
+			infer_full_neighbors<<<block_num, thread_num, 0, strm_hdl>>>(
+				sampled_ids,
+				batch_size,
+				pin_csr_node_index,
+				pin_csr_dst_node_ids,
+				sampled_ids,
+				agg_src_ids,
+				agg_dst_ids,
+				accessed_map,
+				position_map,
+				node_counter,
+				edge_counter);
+			cudaCheckError();
+		}
+		free(h_node_counter);
+		// 图构建
+		construct_graph<<<block_num, thread_num, 0, (strm_hdl)>>>(agg_src_ids, agg_dst_ids, agg_src_off, agg_dst_off,
+																  position_map, edge_counter, node_counter, op_id, dev_id);
+		cudaCheckError();
+		// 更新这一跳的 node/edge 计数
+		counter_update<<<1, 1, 0, (strm_hdl)>>>(node_counter, edge_counter, op_id, 0, 0);
+		cudaCheckError();
+		return;
+	}
 	if(!is_presc){
 		int32_t* h_node_counter = (int32_t*)malloc(16*sizeof(int32_t));
 		cudaMemcpy(h_node_counter, node_counter, 64, cudaMemcpyDeviceToHost);
@@ -457,39 +551,39 @@ void RandomSample(
 		cudaCheckError();
 		free(h_node_counter);
 		free(h_edge_counter);
-		random_sample<<<block_num, thread_num, 0, (strm_hdl)>>>(sampled_ids, op_id, csr_node_index, csr_dst_node_ids, 
+		random_sample<<<block_num, thread_num, 0, (strm_hdl)>>>(sampled_ids, op_id, csr_node_index, csr_dst_node_ids,
 																											tmp_partition_index, tmp_parition_offset,
 																											count, partition_count,
 																											agg_src_ids, agg_dst_ids,
 																											accessed_map,
 																											position_map,
 																											node_counter,
-																											edge_counter, 
-																											dev_id);	
+																											edge_counter,
+																											dev_id);
 		cudaCheckError();
 	}else{
 		int32_t* pin_csr_dst_node_ids = graph -> GetCSRNodeMatrixCPU();
 		int64_t* pin_csr_node_index  = graph -> GetCSRNodeIndexCPU();
 		unsigned long long int* edge_access_time = cache->GetEdgeAccessedMap(dev_id);
-		pre_sample<<<block_num, thread_num, 0, (strm_hdl)>>>(sampled_ids, op_id, pin_csr_node_index, pin_csr_dst_node_ids, 
+		pre_sample<<<block_num, thread_num, 0, (strm_hdl)>>>(sampled_ids, op_id, pin_csr_node_index, pin_csr_dst_node_ids,
 																											partition_index, parition_offset,
 																											count, partition_count,
 																											agg_src_ids, agg_dst_ids,
 																											accessed_map,
 																											position_map,
 																											node_counter,
-																											edge_counter, 
+																											edge_counter,
 																											dev_id,
-																											edge_access_time);	
+																											edge_access_time);
 	}
-	
+
 	cudaCheckError();
 	construct_graph<<<block_num, thread_num, 0, (strm_hdl)>>>(agg_src_ids, agg_dst_ids, agg_src_off, agg_dst_off,
 															  position_map, edge_counter, node_counter, op_id, dev_id);
 	cudaCheckError();
 
-	counter_update<<<1, 1, 0, (strm_hdl)>>>(node_counter, edge_counter, op_id, 0, 0);		
-	cudaCheckError();	
+	counter_update<<<1, 1, 0, (strm_hdl)>>>(node_counter, edge_counter, op_id, 0, 0);
+	cudaCheckError();
 
 	if(!is_presc){
 		cache->FindFeat(sampled_ids, cache_index, node_counter, op_id, strm_hdl, dev_id);
@@ -501,26 +595,31 @@ void RandomSample(
 extern "C"
 void FeatureCacheLookup(
   cudaStream_t    strm_hdl,
-  UnifiedCache*   cache, 
+  UnifiedCache*   cache,
   MemoryPool*     memorypool,
   int32_t         op_id,
   int32_t         dev_id)
-{	
+{
 	int32_t* sampled_ids 		= memorypool->GetSampledIds();
 	int32_t* cache_index 		= memorypool->GetCacheSearchBuffer();
 	float* dst_float_buffer 	= memorypool->GetFloatFeatures();
 	int32_t* node_counter 		= memorypool->GetNodeCounter();
 	int32_t* edge_counter 		= memorypool->GetEdgeCounter();
+	int32_t mode                = memorypool->GetCurrentMode();
 
-	counter_update<<<1, 1, 0, (strm_hdl)>>>(node_counter, edge_counter, op_id, 0, 0);		
+	counter_update<<<1, 1, 0, (strm_hdl)>>>(node_counter, edge_counter, op_id, 0, 0);
 	cudaCheckError();
-	cache->FeatCacheLookup(sampled_ids, cache_index, node_counter, dst_float_buffer, op_id, dev_id, strm_hdl);
+	if (mode == INFERMODE) {
+		cache->InferFeatLookup(sampled_ids, node_counter, dst_float_buffer, op_id, dev_id, strm_hdl);
+	} else {
+		cache->FeatCacheLookup(sampled_ids, cache_index, node_counter, dst_float_buffer, op_id, dev_id, strm_hdl);
+	}
 	cudaCheckError();
-}	
+}
 
 extern "C"
 void IOSubmit(
-	cudaStream_t    strm_hdl, 
+	cudaStream_t    strm_hdl,
 	FeatureStorage* feature,
   	MemoryPool*     memorypool,
 	int32_t			op_id,
@@ -532,7 +631,7 @@ void IOSubmit(
 	// int32_t* node_counter 		= memorypool->GetNodeCounter();
 	// int32_t* edge_counter 		= memorypool->GetEdgeCounter();
 
-	// counter_update<<<1, 1, 0, (strm_hdl)>>>(node_counter, edge_counter, op_id, 0, 0);		
+	// counter_update<<<1, 1, 0, (strm_hdl)>>>(node_counter, edge_counter, op_id, 0, 0);
 	// cudaCheckError();
 	// // feature->IOSubmit(sampled_ids, cache_index, node_counter, dst_float_buffer, op_id, dev_id, strm_hdl);
 	// // cudaCheckError();
@@ -549,8 +648,8 @@ __global__ void ClearPosMap(int32_t* position_map, int32_t* sampled_ids, int32_t
 
 extern "C"
 void IOComplete(
-  cudaStream_t    strm_hdl, 
-  UnifiedCache*   cache, 
+  cudaStream_t    strm_hdl,
+  UnifiedCache*   cache,
   MemoryPool*     memorypool,
   int32_t         dev_id,
   int32_t         mode)

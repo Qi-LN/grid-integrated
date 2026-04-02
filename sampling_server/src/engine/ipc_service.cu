@@ -4,15 +4,18 @@
 #include <cstdint>
 #include <fstream>
 #include <string>
+#include <cstring>
 
 #include <chrono>
 #include <vector>
+#include <algorithm>
 #include <semaphore.h>
 #include <stdio.h>
 #include <stdlib.h>
 
 #include "helper_multiprocess.h"
 #include "system_config.cuh"
+#include "cache.cuh"
 
 // Macro for checking cuda errors following a cuda launch or api call
 #define cudaCheckError()                                       \
@@ -27,6 +30,15 @@
 
 typedef struct shmStruct_st {
   int32_t steps[3];
+  int32_t serve_mode;
+  // shard数量
+  int32_t coord_shard_count;
+  // 每个shard在unified cache里对应的起始偏移坐标
+  int64_t coord_shard_starts[MAX_DEVICE];
+  // 每个 coordinate shard 包含多少个节点
+  int64_t coord_shard_sizes[MAX_DEVICE];
+  // 每个 coordinate shard 对应的一块 GPU 显存的 CUDA IPC handle。TODO：这里需要改成像memHandle的格式
+  cudaIpcMemHandle_t coordHandle[MAX_DEVICE];
   cudaIpcMemHandle_t memHandle[MAX_DEVICE][INTERBATCH_CON][MEMORY_USAGE];
 } shmStruct;
 
@@ -52,16 +64,41 @@ public:
     node_counter_.resize(device_count);
     edge_counter_.resize(device_count);
     device_count_ = device_count;
+    serve_mode_ = SERVE_TRAIN;
 
     semr_.resize(device_count);
     semw_.resize(device_count);
   }
   
+  // 根据 BuildInfo 里的数据集划分和运行模式，计算推理的步数信息，并把这些控制信息写进 IPC 共享内存，供训练/推理进程使用。
   void Coordinate(BuildInfo* info) override {
     // std::cout<<"Start Coordinate Data Parallel Params\n";
     int32_t partition_count = info->partition_count;
     epoch_ = info->epoch;
     raw_batch_size_ = info->raw_batch_size;
+    serve_mode_ = info->serve_mode;
+    shm_->serve_mode = serve_mode_;
+
+    if (serve_mode_ == SERVE_INFER) {
+      infer_batch_size_.clear();
+      int32_t max_infer_size = 0;
+      for (int32_t i = 0; i < partition_count; i++) {
+        int32_t infer_num = info->inference_set_num[i];
+        if (infer_num > max_infer_size) {
+          max_infer_size = infer_num;
+        }
+        infer_batch_size_.push_back(raw_batch_size_);
+      }
+      train_step_ = (max_infer_size + raw_batch_size_ - 1) / raw_batch_size_;
+      valid_step_ = 0;
+      test_step_ = 0;
+      std::cout<<"Infer Steps: "<<train_step_<<"\n";
+      // 虽然叫 train_step_，但在 infer 模式下其实表示的是infer轮数
+      shm_->steps[0] = train_step_;
+      shm_->steps[1] = 0;
+      shm_->steps[2] = 0;
+      return;
+    }
 
     // int32_t max_train_size = 0;
     // for(int32_t i = 0; i < partition_count; i++){
@@ -128,7 +165,33 @@ public:
   }
 
   int32_t GetMaxStep() override {
+    if (serve_mode_ == SERVE_INFER) {
+      return train_step_ * epoch_;
+    }
     return (((train_step_ + valid_step_) * epoch_) + test_step_);
+  }
+
+  // 把当前已经准备好的 coordinate shard 信息写到共享内存 shm_ 里，供训练/推理进程之后通过 IPC 找到这些 shard。
+  void PublishCoordinateShards(UnifiedCache* cache) override {
+    shm_->coord_shard_count = 0;
+    if (!cache->IsCoordinateStoreEnabled()) {
+      // 没开infer模式则直接返回
+      return;
+    }
+    int32_t shard_count = cache->CoordinateShardCount();
+    shm_->coord_shard_count = shard_count;
+    for (int32_t shard = 0; shard < shard_count; ++shard) {
+      // 每个shard在unified cache里对应的起始偏移坐标和大小
+      shm_->coord_shard_starts[shard] = cache->CoordinateShardStart(shard);
+      shm_->coord_shard_sizes[shard] = cache->CoordinateShardSize(shard);
+      // 为有效 shard 导出 CUDA IPC handle
+      if (cache->CoordinateShardSize(shard) > 0 && cache->CoordinateShardPtr(shard) != nullptr) {
+        cudaIpcGetMemHandle((cudaIpcMemHandle_t *)&shm_->coordHandle[shard], cache->CoordinateShardPtr(shard));
+        cudaCheckError();
+      } else {
+        memset((void *)&shm_->coordHandle[shard], 0, sizeof(cudaIpcMemHandle_t));
+      }
+    }
   }
 
   void InitializeSamplesBuffer(int32_t batch_size, int32_t num_ids, int32_t feature_dim, int32_t device_id, int32_t pipeline_depth) override {
@@ -211,6 +274,12 @@ public:
   }
 
   int32_t GetLocalBatchId(int32_t global_batch_id) override {
+    if (serve_mode_ == SERVE_INFER) {
+      if (train_step_ == 0) {
+        return 0;
+      }
+      return global_batch_id % train_step_;
+    }
     int32_t local_batch_id = -1;
     if((global_batch_id) < ((train_step_ + valid_step_) * epoch_)){//train & valid
       int32_t epoch_batch_id = global_batch_id % (train_step_ + valid_step_);
@@ -227,6 +296,9 @@ public:
   }
 
   int32_t GetCurrentBatchsize(int32_t dev_id, int32_t current_mode) override {
+    if (serve_mode_ == SERVE_INFER || current_mode == INFERMODE) {
+      return infer_batch_size_[dev_id];
+    }
     if(current_mode == TRAINMODE){//train
       return train_batch_size_[dev_id];
     }else if(current_mode == VALIDMODE){//valid
@@ -238,6 +310,9 @@ public:
 
   //tape_id / shard_count = batch_id
   int32_t GetCurrentMode(int32_t global_batch_id) override {
+    if (serve_mode_ == SERVE_INFER) {
+      return INFERMODE;
+    }
     int32_t current_mode;
     if((global_batch_id) < ((train_step_ + valid_step_) * epoch_)){//train & valid
       int32_t epoch_batch_id = global_batch_id % (train_step_ + valid_step_);
@@ -321,6 +396,10 @@ public:
   int32_t GetTrainStep() override {
     return train_step_;
   }
+
+  int32_t GetServeMode() override {
+    return serve_mode_;
+  }
   
 private:
   volatile shmStruct *shm_;
@@ -337,6 +416,7 @@ private:
 
   int32_t raw_batch_size_;
   std::vector<int32_t> train_batch_size_;
+  std::vector<int32_t> infer_batch_size_;
   std::vector<int32_t> valid_batch_size_;
   std::vector<int32_t> test_batch_size_;
 
@@ -345,6 +425,7 @@ private:
   int32_t train_step_;
   int32_t valid_step_;
   int32_t test_step_;
+  int32_t serve_mode_;
 
   int32_t epoch_;
   int32_t pipeline_depth_;

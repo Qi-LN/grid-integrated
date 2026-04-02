@@ -37,6 +37,8 @@ public:
         testing_set_num_.resize(partition_count);
         testing_set_ids_.resize(partition_count);
         testing_labels_.resize(partition_count);
+        inference_set_num_.resize(partition_count);
+        inference_set_ids_.resize(partition_count);
 
         partition_count_ = partition_count;
 
@@ -45,6 +47,7 @@ public:
             training_set_num_[part_id] = info->training_set_num[part_id];
             validation_set_num_[part_id] = info->validation_set_num[part_id];
             testing_set_num_[part_id] = info->testing_set_num[part_id];
+            inference_set_num_[part_id] = info->inference_set_num[part_id];
 
             cudaSetDevice(part_id);
             cudaCheckError();
@@ -85,6 +88,15 @@ public:
             testing_labels_[part_id] = test_labels;
             cudaCheckError();
 
+            // 保存当前 part_id 对应的 infer 节点 ID 列表
+            int32_t* infer_ids = nullptr;
+            if (inference_set_num_[part_id] > 0) {
+                cudaMalloc(&infer_ids, inference_set_num_[part_id] * sizeof(int32_t));
+                cudaMemcpy(infer_ids, info->inference_set_ids[part_id].data(), inference_set_num_[part_id] * sizeof(int32_t), cudaMemcpyHostToDevice);
+                cudaCheckError();
+            }
+            inference_set_ids_[part_id] = infer_ids;
+
         }
 
     };
@@ -99,6 +111,9 @@ public:
             cudaFree(training_labels_[i]);
             cudaFree(validation_labels_[i]);
             cudaFree(testing_labels_[i]);
+            if (inference_set_ids_[i] != nullptr) {
+                cudaFree(inference_set_ids_[i]);
+            }
         }
     }
 
@@ -110,6 +125,9 @@ public:
     }
     int32_t* GetTestingSetIds(int32_t part_id) const override {
         return testing_set_ids_[part_id];
+    }
+    int32_t* GetInferenceSetIds(int32_t part_id) const override {
+        return inference_set_ids_[part_id];
     }
 
 	int32_t* GetTrainingLabels(int32_t part_id) const override {
@@ -130,6 +148,9 @@ public:
     }
     int32_t TestingSetSize(int32_t part_id) const override {
         return testing_set_num_[part_id];
+    }
+    int32_t InferenceSetSize(int32_t part_id) const override {
+        return inference_set_num_[part_id];
     }
 
     int32_t TotalNodeNum() const override {
@@ -161,10 +182,12 @@ private:
     std::vector<int32_t*> training_set_ids_;
     std::vector<int32_t*> validation_set_ids_;
     std::vector<int32_t*> testing_set_ids_;
+    std::vector<int32_t*> inference_set_ids_;
 
     std::vector<int32_t*> training_labels_;
     std::vector<int32_t*> validation_labels_;
     std::vector<int32_t*> testing_labels_;
+    std::vector<int> inference_set_num_;
 
     int32_t partition_count_;
     int32_t total_num_nodes_;

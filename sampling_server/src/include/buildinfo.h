@@ -1,6 +1,7 @@
 #ifndef BUILD_INFO_H
 #define BUILD_INFO_H
 #include <cstdint>
+#include <string>
 #include <vector>
 
 struct BuildInfo{
@@ -20,10 +21,13 @@ struct BuildInfo{
     std::vector<int32_t> testing_set_num;
     std::vector<std::vector<int32_t>> testing_set_ids;
     std::vector<std::vector<int32_t>> testing_labels;
+    std::vector<int32_t> inference_set_num;
+    std::vector<std::vector<int32_t>> inference_set_ids;
     //features
     int32_t total_num_nodes;
     int32_t float_feature_len;
     float* host_float_feature;//allocated by cudaHostAlloc
+    int64_t max_degree;
 
     //bam params
     uint32_t        cudaDevice;
@@ -65,6 +69,8 @@ struct BuildInfo{
     //train
     int32_t epoch;
     int32_t raw_batch_size;
+    int32_t serve_mode;
+    std::string rootset_path;
 
     //iostack 
     int32_t num_ssd;
