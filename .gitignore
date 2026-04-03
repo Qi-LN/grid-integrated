@@ -10,3 +10,7 @@ training_backend/build
 training_backend/dist
 training_backend/ipcservice.egg-info
 dataset/products
+.codex
+legion.tar.gz
+__pycache__/legion_server.cpython-312.pyc
+legion-train-42166.out
