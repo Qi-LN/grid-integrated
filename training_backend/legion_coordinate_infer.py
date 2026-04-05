@@ -50,10 +50,12 @@ def infer_one_step(model, coord_dim, device):
     with torch.no_grad():
         # 前向推理
         updated_coords = model(block, features)
+        print("推理成功")
         # labels 在 infer 模式下不是分类标签，而是“这些 root 在本地 shard 中的位置偏移”
         root_local_offsets = labels[:block_dst_num].contiguous()
         # 把 labels[:block_dst_num] 作为 root_local_offsets 传给 IPC 服务，告诉它哪些节点的坐标被更新了
         ipc_service.update_coordinates(root_local_offsets, updated_coords.contiguous())
+        print("坐标更新成功")
 
     torch.cuda.synchronize(device)
     ipc_service.synchronize()

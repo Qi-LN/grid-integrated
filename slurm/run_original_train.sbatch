@@ -1,5 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=legion-train
+#SBATCH --partition=Nvidia_A800
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -12,10 +13,22 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
+# 加载环境
+source ~/anaconda3/etc/profile.d/conda.sh
+conda activate /public/home/liufang395/anaconda3/envs/megatron_env
+module load compiler/gcc/11.5.0
+
 # 环境变量，分布式Master_addr和port
 export PYTHONUNBUFFERED=1
 export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 export MASTER_PORT="${MASTER_PORT:-$((12000 + (${SLURM_JOB_ID:-1} % 20000)))}"
+
+export CUDA_HOME=/usr/local/cuda-12.2
+export PATH=/usr/local/cuda-12.2/bin:$PATH
+export LD_LIBRARY_PATH=/usr/local/cuda-12.2/lib64:$LD_LIBRARY_PATH
+hash -r
+
+SERVER_LOG="${SERVER_LOG:-$REPO_ROOT/slurm/server.log}"
 
 
 MODEL="${MODEL:-graphsage}"
@@ -26,6 +39,8 @@ CACHE_MEMORY="${CACHE_MEMORY:-38000000}"
 BUILD_JOBS="${BUILD_JOBS:-8}"
 SERVER_READY_TIMEOUT="${SERVER_READY_TIMEOUT:-1800}"
 SERVER_LOG="${SERVER_LOG:-$REPO_ROOT/server-${SLURM_JOB_ID:-manual}.log}"
+
+GPU_NUMBER="${GPU_NUMBER:-8}"
 
 case "$DATASET_NAME" in
     products)
@@ -87,6 +102,7 @@ python legion_server.py \
     --gpu_number "$GPU_NUMBER" \
     --epoch "$EPOCH" \
     --cache_memory "$CACHE_MEMORY" \
+    --usenvlink 0 \
     > "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 

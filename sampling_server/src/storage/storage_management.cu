@@ -1,5 +1,6 @@
 #include "storage_management.cuh"
 #include "storage_management_impl.cuh"
+#include "system_config.cuh"
 
 namespace {
 

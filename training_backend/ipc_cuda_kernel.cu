@@ -81,9 +81,17 @@ public:
       coordinate_shards_.resize(coord_shard_count_, nullptr);
       for (int32_t shard = 0; shard < coord_shard_count_; ++shard) {
         // 从共享内存 shm->coordHandle[shard] 里取出一个 CUDA IPC handle，然后在当前进程中把它打开，得到一个可用的设备指针，存到 coordinate_shards_[shard] 里。
+        // if (shm->coord_shard_sizes[shard] > 0) {
+        //   cudaIpcOpenMemHandle(&coordinate_shards_[shard], *(cudaIpcMemHandle_t*)&shm->coordHandle[shard], cudaIpcMemLazyEnablePeerAccess);
+        //   cudaCheckError();
+        // }
         if (shm->coord_shard_sizes[shard] > 0) {
-          cudaIpcOpenMemHandle(&coordinate_shards_[shard], *(cudaIpcMemHandle_t*)&shm->coordHandle[shard], cudaIpcMemLazyEnablePeerAccess);
+          void* shard_ptr = nullptr;
+          cudaIpcOpenMemHandle(&shard_ptr,
+                              *(cudaIpcMemHandle_t*)&shm->coordHandle[shard],
+                              cudaIpcMemLazyEnablePeerAccess);
           cudaCheckError();
+          coordinate_shards_[shard] = static_cast<float*>(shard_ptr);
         }
       }
       // 单独保存一份本卡的shard指针

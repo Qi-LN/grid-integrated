@@ -1,22 +1,36 @@
 #!/bin/bash
 #SBATCH --job-name=legion-infer
+#SBATCH -p Nvidia_A800
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --gres=gpu:1
-#SBATCH --output=legion-infer-%j.out
+#SBATCH --gres=gpu:8
+#SBATCH --output=infer.out
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+#REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+#cd "$REPO_ROOT"
+REPO_ROOT="$(cd "${SLURM_SUBMIT_DIR:-$PWD}/.." && pwd)"
 cd "$REPO_ROOT"
 
-export PYTHONUNBUFFERED=1
 
-GPU_NUMBER="${GPU_NUMBER:-${SLURM_GPUS_ON_NODE:-1}}"
-if ! [[ "$GPU_NUMBER" =~ ^[0-9]+$ ]]; then
-    GPU_NUMBER="$(nvidia-smi -L | wc -l | tr -d ' ')"
-fi
+# 加载环境
+source ~/anaconda3/etc/profile.d/conda.sh
+conda activate /public/home/liufang395/anaconda3/envs/megatron_env
+module load compiler/gcc/11.5.0
+
+# 环境变量，分布式Master_addr和port
+export PYTHONUNBUFFERED=1
+export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
+export MASTER_PORT="${MASTER_PORT:-$((12000 + (${SLURM_JOB_ID:-1} % 20000)))}"
+
+export CUDA_HOME=/usr/local/cuda-12.2
+export PATH=/usr/local/cuda-12.2/bin:$PATH
+export LD_LIBRARY_PATH=/usr/local/cuda-12.2/lib64:$LD_LIBRARY_PATH
+hash -r
+
+SERVER_LOG="${SERVER_LOG:-$REPO_ROOT/slurm/server.log}"
 
 DATASET_NAME="${DATASET_NAME:-products}"
 DATASET_PATH="${DATASET_PATH:-dataset}"
@@ -24,7 +38,8 @@ ROOTSET_PATH="${ROOTSET_PATH:-$DATASET_PATH/$DATASET_NAME/rootset}"
 EPOCH="${EPOCH:-2}"
 BUILD_JOBS="${BUILD_JOBS:-8}"
 SERVER_READY_TIMEOUT="${SERVER_READY_TIMEOUT:-1800}"
-SERVER_LOG="${SERVER_LOG:-$REPO_ROOT/infer-server-${SLURM_JOB_ID:-manual}.log}"
+# HOPS_NUM="${HOPS_NUM:-1}"
+GPU_NUMBER="${GPU_NUMBER:-8}"
 
 case "$DATASET_NAME" in
     products)
@@ -49,10 +64,11 @@ make -C sampling_server -j "$BUILD_JOBS"
 
 (
     cd training_backend
-    CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}" python setup.py build_ext --inplace
+    CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-12.2}" python setup.py install  #build_ext --inplace
 )
 
-python legion_server.py \
+# python legion_server.py \
+stdbuf -oL -eL python legion_server.py \
     --dataset_path "$DATASET_PATH" \
     --dataset_name "$DATASET_NAME" \
     --train_batch_size "$TRAIN_BATCH_SIZE" \
@@ -61,6 +77,7 @@ python legion_server.py \
     --cache_memory 0 \
     --mode infer \
     --rootset_path "$ROOTSET_PATH" \
+    --usenvlink 0 \
     > "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 
