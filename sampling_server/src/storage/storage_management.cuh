@@ -52,9 +52,14 @@ private:
 
   std::string dataset_path_;
   std::string rootset_path_;
+  std::string partition_meta_path_;
   int32_t raw_batch_size_;
   int32_t epoch_;
   int32_t serve_mode_;
+  int32_t node_rank_;
+  int32_t num_nodes_;
+  int32_t local_gpu_number_;
+  int32_t infer_step_override_;
   int32_t num_ssd_;
   int32_t num_queues_per_ssd_;
   int32_t cpu_cache_capacity_;//for Helios
@@ -65,4 +70,3 @@ private:
   UnifiedCache* cache_;
   IPCEnv* env_;
 };
-

@@ -38,6 +38,7 @@ public:
         testing_set_ids_.resize(partition_count);
         testing_labels_.resize(partition_count);
         inference_set_num_.resize(partition_count);
+        inference_shard_num_.resize(partition_count);
         inference_set_ids_.resize(partition_count);
 
         partition_count_ = partition_count;
@@ -48,6 +49,9 @@ public:
             validation_set_num_[part_id] = info->validation_set_num[part_id];
             testing_set_num_[part_id] = info->testing_set_num[part_id];
             inference_set_num_[part_id] = info->inference_set_num[part_id];
+            inference_shard_num_[part_id] = info->inference_shard_num.empty()
+                ? info->inference_set_num[part_id]
+                : info->inference_shard_num[part_id];
 
             cudaSetDevice(part_id);
             cudaCheckError();
@@ -90,9 +94,9 @@ public:
 
             // 保存当前 part_id 对应的 infer 节点 ID 列表
             int32_t* infer_ids = nullptr;
-            if (inference_set_num_[part_id] > 0) {
-                cudaMalloc(&infer_ids, inference_set_num_[part_id] * sizeof(int32_t));
-                cudaMemcpy(infer_ids, info->inference_set_ids[part_id].data(), inference_set_num_[part_id] * sizeof(int32_t), cudaMemcpyHostToDevice);
+            if (inference_shard_num_[part_id] > 0) {
+                cudaMalloc(&infer_ids, inference_shard_num_[part_id] * sizeof(int32_t));
+                cudaMemcpy(infer_ids, info->inference_set_ids[part_id].data(), inference_shard_num_[part_id] * sizeof(int32_t), cudaMemcpyHostToDevice);
                 cudaCheckError();
             }
             inference_set_ids_[part_id] = infer_ids;
@@ -130,7 +134,7 @@ public:
         return inference_set_ids_[part_id];
     }
 
-	int32_t* GetTrainingLabels(int32_t part_id) const override {
+    int32_t* GetTrainingLabels(int32_t part_id) const override {
         return training_labels_[part_id];
     };
     int32_t* GetValidationLabels(int32_t part_id) const override {
@@ -152,6 +156,9 @@ public:
     int32_t InferenceSetSize(int32_t part_id) const override {
         return inference_set_num_[part_id];
     }
+    int32_t InferenceShardSize(int32_t part_id) const override {
+        return inference_shard_num_[part_id];
+    }
 
     int32_t TotalNodeNum() const override {
         return total_num_nodes_;
@@ -167,7 +174,7 @@ public:
     void IOSubmit(int32_t* sampled_ids, int32_t* cache_index,
                   int32_t* node_counter, float* dst_float_buffer,
                   int32_t op_id, int32_t dev_id, cudaStream_t strm_hdl) override {
-		//TODO
+        //TODO
     }
 
     void IOComplete() override {
@@ -188,6 +195,7 @@ private:
     std::vector<int32_t*> validation_labels_;
     std::vector<int32_t*> testing_labels_;
     std::vector<int> inference_set_num_;
+    std::vector<int> inference_shard_num_;
 
     int32_t partition_count_;
     int32_t total_num_nodes_;

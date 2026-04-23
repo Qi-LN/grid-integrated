@@ -2,6 +2,14 @@
 #include "storage_management_impl.cuh"
 #include "system_config.cuh"
 
+#include <fstream>
+#include <sstream>
+#include <unordered_set>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <cstdlib>
+
 namespace {
 
 int32_t resolve_owner_by_position(int64_t position, int32_t shard_count, int64_t total_count) {
@@ -15,8 +23,49 @@ int32_t resolve_owner_by_position(int64_t position, int32_t shard_count, int64_t
     return static_cast<int32_t>(owner);
 }
 
+// 检查某个路径对应的文件或目录是否存在
+bool file_exists(const std::string& path) {
+    return access(path.c_str(), F_OK) == 0;
 }
 
+// 把一个二进制文件按 int32_t 数组读出来，返回一个 std::vector<int32_t>
+// 布局：[int32_t][int32_t][int32_t]...
+std::vector<int32_t> read_int32_binary_file(const std::string& path) {
+    std::vector<int32_t> result;
+    if (!file_exists(path)) {
+        return result;
+    }
+    std::ifstream in(path, std::ios::binary | std::ios::ate);
+    if (!in.is_open()) {
+        return result;
+    }
+    std::streamsize size = in.tellg();
+    in.seekg(0, std::ios::beg);
+    if (size <= 0) {
+        return result;
+    }
+    result.resize(static_cast<size_t>(size) / sizeof(int32_t));
+    in.read(reinterpret_cast<char*>(result.data()), size);
+    return result;
+}
+
+
+// 尝试从一个文本文件里读取一个 int32_t 整数；如果文件不存在或打不开，就返回默认值
+// 干啥的？？？
+int32_t read_optional_int32_text_file(const std::string& path, int32_t default_value) {
+    if (!file_exists(path)) {
+        return default_value;
+    }
+    std::ifstream in(path);
+    if (!in.is_open()) {
+        return default_value;
+    }
+    int32_t value = default_value;
+    in >> value;
+    return value;
+}
+
+}
 
 void StorageManagement::EnableP2PAccess(){
     int32_t device_count = -1;
@@ -52,6 +101,14 @@ void StorageManagement::ReadMetaFIle(BuildInfo* info){
     getline(Metafile, buff);
     iss.clear();
     iss.str(buff);
+
+    // 默认初始化
+    partition_meta_path_ = "-";
+    node_rank_ = 0;
+    num_nodes_ = 1;
+    local_gpu_number_ = info->partition_count;
+    infer_step_override_ = -1;
+
     if(in_memory_mode_){
         iss >> dataset_path_;
         std::cout<<"Dataset path:       "<<dataset_path_<<"\n";
@@ -85,6 +142,36 @@ void StorageManagement::ReadMetaFIle(BuildInfo* info){
             std::cout<<"Rootset path:       "<<rootset_path_<<"\n";
         } else {
             rootset_path_ = "-";
+            iss.clear();
+        }
+        if (iss >> partition_meta_path_) {
+            std::cout<<"Partition meta:     "<<partition_meta_path_<<"\n";
+        } else {
+            partition_meta_path_ = "-";
+            iss.clear();
+        }
+        if (iss >> node_rank_) {
+            std::cout<<"Node rank:          "<<node_rank_<<"\n";
+        } else {
+            node_rank_ = 0;
+            iss.clear();
+        }
+        if (iss >> num_nodes_) {
+            std::cout<<"Num nodes:          "<<num_nodes_<<"\n";
+        } else {
+            num_nodes_ = 1;
+            iss.clear();
+        }
+        if (iss >> local_gpu_number_) {
+            std::cout<<"Local GPU num:      "<<local_gpu_number_<<"\n";
+        } else {
+            local_gpu_number_ = info->partition_count;
+            iss.clear();
+        }
+        if (iss >> infer_step_override_) {
+            std::cout<<"Infer step override:"<<infer_step_override_<<"\n";
+        } else {
+            infer_step_override_ = -1;
             iss.clear();
         }
     }else{
@@ -122,6 +209,36 @@ void StorageManagement::ReadMetaFIle(BuildInfo* info){
             rootset_path_ = "-";
             iss.clear();
         }
+        if (iss >> partition_meta_path_) {
+            std::cout<<"Partition meta:     "<<partition_meta_path_<<"\n";
+        } else {
+            partition_meta_path_ = "-";
+            iss.clear();
+        }
+        if (iss >> node_rank_) {
+            std::cout<<"Node rank:          "<<node_rank_<<"\n";
+        } else {
+            node_rank_ = 0;
+            iss.clear();
+        }
+        if (iss >> num_nodes_) {
+            std::cout<<"Num nodes:          "<<num_nodes_<<"\n";
+        } else {
+            num_nodes_ = 1;
+            iss.clear();
+        }
+        if (iss >> local_gpu_number_) {
+            std::cout<<"Local GPU num:      "<<local_gpu_number_<<"\n";
+        } else {
+            local_gpu_number_ = info->partition_count;
+            iss.clear();
+        }
+        if (iss >> infer_step_override_) {
+            std::cout<<"Infer step override:"<<infer_step_override_<<"\n";
+        } else {
+            infer_step_override_ = -1;
+            iss.clear();
+        }
         iss >> partition_;
         std::cout<<"Partition?:         "<<partition_<<"\n";
         iss >> num_ssd_;
@@ -135,7 +252,11 @@ void StorageManagement::ReadMetaFIle(BuildInfo* info){
     }
     info->serve_mode = serve_mode_;
     info->rootset_path = rootset_path_;
-
+    info->partition_meta_path = partition_meta_path_;
+    info->node_rank = node_rank_;
+    info->num_nodes = num_nodes_;
+    info->local_gpu_number = local_gpu_number_;
+    info->infer_step_override = infer_step_override_;
 }
 
 void StorageManagement::LoadGraph(BuildInfo* info){
@@ -205,7 +326,7 @@ void StorageManagement::LoadFeature(BuildInfo* info){
     std::vector<int32_t> all_labels;
     all_labels.resize(node_num);
     int32_t* partition_index = (int32_t*)malloc(int64_t(node_num) * sizeof(int32_t));
-    float* host_float_feature;
+    float* host_float_feature = nullptr;
 
     mmap_trainingset_read(training_path, training_ids);
     mmap_trainingset_read(validation_path, validation_ids);
@@ -219,7 +340,6 @@ void StorageManagement::LoadFeature(BuildInfo* info){
     int32_t fdret = mmap_partition_read(partition_path, partition_index);
 
     std::cout<<"Finish Reading All Files\n";
-
     // partition nodes，把顶点分配到每个gpu内的集合中。
     // training_ids->info->training_set_ids
 
@@ -260,21 +380,21 @@ void StorageManagement::LoadFeature(BuildInfo* info){
 
     //partition labels
     for(int32_t part_id = 0; part_id < partition_count; part_id++){
-        for(int32_t i = 0; i < info->training_set_ids[part_id].size(); i++){
+        for(int32_t i = 0; i < (int32_t)info->training_set_ids[part_id].size(); i++){
             int32_t ts_label = all_labels[info->training_set_ids[part_id][i]];
             info->training_labels[part_id].push_back(ts_label);
         }
         info->training_set_num.push_back(info->training_set_ids[part_id].size());
     }
     for(int32_t part_id = 0; part_id < partition_count; part_id++){
-        for(int32_t i = 0; i < info->validation_set_ids[part_id].size(); i++){
+        for(int32_t i = 0; i < (int32_t)info->validation_set_ids[part_id].size(); i++){
             int32_t ts_label = all_labels[info->validation_set_ids[part_id][i]];
             info->validation_labels[part_id].push_back(ts_label);
         }
         info->validation_set_num.push_back(info->validation_set_ids[part_id].size());
     }
     for(int32_t part_id = 0; part_id < partition_count; part_id++){
-        for(int32_t i = 0; i < info->testing_set_ids[part_id].size(); i++){
+        for(int32_t i = 0; i < (int32_t)info->testing_set_ids[part_id].size(); i++){
             int32_t ts_label = all_labels[info->testing_set_ids[part_id][i]];
             info->testing_labels[part_id].push_back(ts_label);
         }
@@ -285,8 +405,81 @@ void StorageManagement::LoadFeature(BuildInfo* info){
     info->float_feature_len = float_feature_len_;
     info->total_num_nodes = node_num_;
 
+    // 在推理服务模式下，从磁盘上的 partition metadata 中读取“每个 GPU 负责哪些 owner roots、哪些 halo nodes”，并做严格一致性检查
+    bool loaded_partition_meta = false;
+    if (serve_mode_ == SERVE_INFER && partition_meta_path_ != "-" && !partition_meta_path_.empty()) {
+        std::string infer_step_path = partition_meta_path_ + "/infer_steps.txt";
+        int32_t infer_steps_from_meta = read_optional_int32_text_file(infer_step_path, infer_step_override_);
+        if (infer_steps_from_meta > 0) {
+            info->infer_step_override = infer_steps_from_meta;
+            infer_step_override_ = infer_steps_from_meta;
+        } else if (num_nodes_ > 1) {
+            std::cout << "missing infer_steps.txt for multi-node partition metadata\n";
+            exit(EXIT_FAILURE);
+        }
+
+        // 构造当前节点 metadata 目录
+        std::string node_meta_dir = partition_meta_path_ + "/node_" + std::to_string(node_rank_);
+        std::unordered_set<int32_t> seen_local_nodes;
+        int64_t total_owner_roots = 0;
+        int64_t total_halo_nodes = 0;
+        for (int32_t part_id = 0; part_id < partition_count; ++part_id) {
+            std::string owner_path = node_meta_dir + "/gpu_" + std::to_string(part_id) + "_owner_roots.bin";
+            std::string halo_path = node_meta_dir + "/gpu_" + std::to_string(part_id) + "_halo_nodes.bin";
+            std::vector<int32_t> owner_roots = read_int32_binary_file(owner_path);
+            std::vector<int32_t> halo_nodes = read_int32_binary_file(halo_path);
+
+            // 处理 owner_roots
+            std::unordered_set<int32_t> owner_set;
+            for (int32_t node_id : owner_roots) {
+                if (node_id < 0 || node_id >= node_num_) {
+                    std::cout << "invalid owner root id in metadata: " << node_id << "\n";
+                    exit(EXIT_FAILURE);
+                }
+                // 放进 owner_set
+                owner_set.insert(node_id);
+                // 检查当前 node 内是否跨 GPU 重复,避免这个 node_id 之前已经分给本节点的其他 GPU 了。
+                if (!seen_local_nodes.insert(node_id).second) {
+                    std::cout << "duplicate local shard node across GPUs: " << node_id << "\n";
+                    exit(EXIT_FAILURE);
+                }
+                // 把 owner root 记录到该 GPU 的 inference set 里。
+                // 没区分 owner 和 halo 的存储位置，都会被放进同一个 inference_set_ids[part_id] 中，owner 先放，halo 后放。
+                info->inference_set_ids[part_id].push_back(node_id);
+            }
+            // 处理 halo_nodes
+            for (int32_t node_id : halo_nodes) {
+                if (node_id < 0 || node_id >= node_num_) {
+                    std::cout << "invalid halo node id in metadata: " << node_id << "\n";
+                    exit(EXIT_FAILURE);
+                }
+                // 检查 halo 和 owner 是否重叠
+                if (owner_set.find(node_id) != owner_set.end()) {
+                    std::cout << "owner/halo overlap in metadata for gpu " << part_id << ": " << node_id << "\n";
+                    exit(EXIT_FAILURE);
+                }
+                // 检查是否跨 GPU 重复
+                if (!seen_local_nodes.insert(node_id).second) {
+                    std::cout << "duplicate local shard node across GPUs: " << node_id << "\n";
+                    exit(EXIT_FAILURE);
+                }
+                // 追加到 inference_set_ids
+                info->inference_set_ids[part_id].push_back(node_id);
+            }
+            // 记录每个 GPU 的 owner 数
+            info->inference_set_num.push_back(static_cast<int32_t>(owner_roots.size()));
+            // 记录每个 GPU 的总 shard 数
+            info->inference_shard_num.push_back(static_cast<int32_t>(owner_roots.size() + halo_nodes.size()));
+            total_owner_roots += owner_roots.size();
+            total_halo_nodes += halo_nodes.size();
+        }
+        std::cout << "Inference owner roots: " << total_owner_roots << "\n";
+        std::cout << "Inference halo nodes:  " << total_halo_nodes << "\n";
+        loaded_partition_meta = true;
+    }
+    // 如果前面没有成功加载 partition metadata，那么就退而求其次，从一个 rootset 文件里读出一串 root 节点，并按“位置”把这些 root 分配给各个 GPU。
     // partition inference root. 文件->info->inference_set_ids. TODO:修改为按GPU加载
-    if (serve_mode_ == SERVE_INFER && rootset_path_ != "-" && !rootset_path_.empty()) {
+    if (!loaded_partition_meta && serve_mode_ == SERVE_INFER && rootset_path_ != "-" && !rootset_path_.empty()) {
         int32_t root_fd = open(rootset_path_.c_str(), O_RDONLY);
         if (root_fd == -1) {
             std::cout<<"cannout open file: "<<rootset_path_<<"\n";
@@ -313,8 +506,12 @@ void StorageManagement::LoadFeature(BuildInfo* info){
             }
         }
     }
-    for (int32_t part_id = 0; part_id < partition_count; ++part_id) {
-        info->inference_set_num.push_back(info->inference_set_ids[part_id].size());
+    // 兜底初始化，如果前面没有给 inference_shard_num 赋值，那么就默认把每个 partition 的 inference_set_ids 全都视为“owner 集合”，同时也把它当成完整 shard。
+    if (info->inference_shard_num.empty()) {
+        for (int32_t part_id = 0; part_id < partition_count; ++part_id) {
+            info->inference_set_num.push_back(info->inference_set_ids[part_id].size());
+            info->inference_shard_num.push_back(info->inference_set_ids[part_id].size());
+        }
     }
 }
 

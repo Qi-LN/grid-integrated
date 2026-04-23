@@ -357,7 +357,7 @@ void UnifiedCache::InitializeCoordinateStore(FeatureStorage* feature) {
 
     for (int32_t dev_id = 0; dev_id < device_count_; ++dev_id) {
         cudaSetDevice(dev_id);
-        int64_t shard_size = feature->InferenceSetSize(dev_id);
+        int64_t shard_size = feature->InferenceShardSize(dev_id);
         // 当前shard在unified空间上的起始base地址
         coordinate_starts_[dev_id] = global_root_offset;
         // 每个shard的大小
@@ -429,8 +429,10 @@ void UnifiedCache::InitializeCoordinateStore(FeatureStorage* feature) {
         d_coordinate_shard_offsets_[dev_id] = shard_offsets;
     }
 
-    if (global_root_offset != total_num_nodes_) {
-        std::cout<<"Warning: coordinate roots "<<global_root_offset<<" != total nodes "<<total_num_nodes_<<"\n";
+    if (global_root_offset == 0) {
+        std::cout<<"Warning: coordinate shard store is empty\n";
+    } else {
+        std::cout<<"Coordinate shard entries: "<<global_root_offset<<"\n";
     }
     cudaDeviceSynchronize();
 }

@@ -1,5 +1,7 @@
 #include <iostream>
 #include <vector>
+#include <string>
+#include <cstring>
 #include "helper_multiprocess.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,6 +38,27 @@ typedef struct shmStruct_st {
   cudaIpcMemHandle_t memHandle[MAX_DEVICE][INTERBATCH_CON][MEMORY_USAGE];
 } shmStruct;
 
+// 给本地 IPC 资源生成一组“带命名空间的名字”，用于区分不同作业、不同节点，避免共享内存和信号量重名冲突。
+namespace {
+std::string LegionIPCNamespace() {
+  const char* ns = std::getenv("LEGION_IPC_NAMESPACE");
+  if (ns == nullptr || std::strlen(ns) == 0) {
+    return std::string();
+  }
+  return std::string("_") + ns;
+}
+
+// 生成共享内存对象的名字:"simpleIPCshm_id"
+std::string LegionSharedMemoryName() {
+  return std::string("simpleIPCshm") + LegionIPCNamespace();
+}
+
+// 为一组信号量生成“前缀名”:"sem_id"
+std::string LegionSemaphorePrefix(const char* base) {
+  return std::string(base) + LegionIPCNamespace() + "_";
+}
+}
+
 class GPUIPCEnv : public IPCEnv {
 public:
   int Initialize() override {
@@ -45,8 +68,8 @@ public:
     cudaCheckError();
     central_device_ = central_device;
     sharedMemoryInfo info;
-    const char shmName[] = "simpleIPCshm";
-    if (sharedMemoryCreate(shmName, sizeof(*shm), &info) != 0) {
+    std::string shmName = LegionSharedMemoryName();
+    if (sharedMemoryCreate(shmName.c_str(), sizeof(*shm), &info) != 0) {
       printf("Failed to create shared memory slab\n");
       exit(EXIT_FAILURE);
     }
@@ -105,8 +128,8 @@ public:
     semr_.resize(INTERBATCH_CON);
     semw_.resize(INTERBATCH_CON);
     for(int i = 0; i < INTERBATCH_CON; i++){
-      std::string ssr = "sem_r_";
-      std::string ssw = "sem_w_";
+      std::string ssr = LegionSemaphorePrefix("sem_r");
+      std::string ssw = LegionSemaphorePrefix("sem_w");
       std::string ssri = ssr + std::to_string(central_device) + "_" + std::to_string(i);
       std::string sswi = ssw + std::to_string(central_device) + "_" + std::to_string(i);
       semr_[i] = sem_open(ssri.c_str(), O_CREAT | O_RDWR, 0666, 0);

@@ -17,6 +17,24 @@
 #include "system_config.cuh"
 #include "cache.cuh"
 
+namespace {
+std::string LegionIPCNamespace() {
+  const char* ns = std::getenv("LEGION_IPC_NAMESPACE");
+  if (ns == nullptr || std::strlen(ns) == 0) {
+    return std::string();
+  }
+  return std::string("_") + ns;
+}
+
+std::string LegionSharedMemoryName() {
+  return std::string("simpleIPCshm") + LegionIPCNamespace();
+}
+
+std::string LegionSemaphorePrefix(const char* base) {
+  return std::string(base) + LegionIPCNamespace() + "_";
+}
+}
+
 // Macro for checking cuda errors following a cuda launch or api call
 #define cudaCheckError()                                       \
   {                                                            \
@@ -46,8 +64,10 @@ class CUDAIPCEnv : public IPCEnv {
 public:
   CUDAIPCEnv(int32_t device_count){
     // std::cout<<"start initialize ipc env\n";
-    const char shmName[] = "simpleIPCshm";
-    if (sharedMemoryCreate(shmName, sizeof(*shm_), &info_) != 0) {
+    // const char shmName[] = "simpleIPCshm";
+    // if (sharedMemoryCreate(shmName, sizeof(*shm_), &info_) != 0) {
+    std::string shmName = LegionSharedMemoryName();
+    if (sharedMemoryCreate(shmName.c_str(), sizeof(*shm_), &info_) != 0) {
       printf("Failed to create shared memory slab\n");
       exit(EXIT_FAILURE);
     }
@@ -90,6 +110,9 @@ public:
         infer_batch_size_.push_back(raw_batch_size_);
       }
       train_step_ = (max_infer_size + raw_batch_size_ - 1) / raw_batch_size_;
+      if (info->infer_step_override > 0) {
+        train_step_ = info->infer_step_override;
+      }
       valid_step_ = 0;
       test_step_ = 0;
       std::cout<<"Infer Steps: "<<train_step_<<"\n";
@@ -196,8 +219,10 @@ public:
 
   void InitializeSamplesBuffer(int32_t batch_size, int32_t num_ids, int32_t feature_dim, int32_t device_id, int32_t pipeline_depth) override {
     cudaSetDevice(device_id);
-    std::string ssr = "sem_r_";
-    std::string ssw = "sem_w_";
+    // std::string ssr = "sem_r_";
+    // std::string ssw = "sem_w_";
+    std::string ssr = LegionSemaphorePrefix("sem_r");
+    std::string ssw = LegionSemaphorePrefix("sem_w");
     (semr_[device_id]).resize(pipeline_depth);
     (semw_[device_id]).resize(pipeline_depth);
     for(int32_t i = 0; i < pipeline_depth; i++){

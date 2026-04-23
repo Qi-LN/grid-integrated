@@ -23,6 +23,7 @@ public:
     virtual int32_t ValidationSetSize(int32_t part_id) const = 0;
     virtual int32_t TestingSetSize(int32_t part_id) const = 0;
     virtual int32_t InferenceSetSize(int32_t part_id) const = 0;
+    virtual int32_t InferenceShardSize(int32_t part_id) const = 0;
 
     virtual int32_t TotalNodeNum() const = 0;
     virtual float* GetAllFloatFeature() const = 0;

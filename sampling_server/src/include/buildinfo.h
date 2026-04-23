@@ -22,6 +22,7 @@ struct BuildInfo{
     std::vector<std::vector<int32_t>> testing_set_ids;
     std::vector<std::vector<int32_t>> testing_labels;
     std::vector<int32_t> inference_set_num;
+    std::vector<int32_t> inference_shard_num;
     std::vector<std::vector<int32_t>> inference_set_ids;
     //features
     int32_t total_num_nodes;
@@ -57,7 +58,7 @@ struct BuildInfo{
     bool random;
     uint64_t ssdtype;
 
-    //csr
+    // csr
     // std::vector<std::vector<int64_t>> csr_node_index;
     // std::vector<std::vector<int32_t>> csr_dst_node_ids;
     int64_t* csr_node_index;
@@ -71,6 +72,11 @@ struct BuildInfo{
     int32_t raw_batch_size;
     int32_t serve_mode;
     std::string rootset_path;
+    std::string partition_meta_path;
+    int32_t node_rank;
+    int32_t num_nodes;
+    int32_t local_gpu_number;
+    int32_t infer_step_override;
 
     //iostack 
     int32_t num_ssd;
