@@ -38,6 +38,7 @@ EPOCH="${EPOCH:-2}"
 BUILD_JOBS="${BUILD_JOBS:-8}"
 SERVER_READY_TIMEOUT="${SERVER_READY_TIMEOUT:-1800}"
 GPU_NUMBER="${GPU_NUMBER:-8}"
+GENERATE_HALO_META="${GENERATE_HALO_META:-0}"
 
 case "$DATASET_NAME" in
     products)
@@ -56,6 +57,16 @@ case "$DATASET_NAME" in
         HIDDEN_DIM="${HIDDEN_DIM:-256}"
         ;;
 esac
+
+if [ "$GENERATE_HALO_META" = "1" ]; then
+    python dataset/gen_halo_partition_meta.py \
+        --dataset_path "$DATASET_PATH" \
+        --dataset_name "$DATASET_NAME" \
+        --num_nodes "$SLURM_JOB_NUM_NODES" \
+        --gpus_per_node "$GPU_NUMBER" \
+        --batch_size "$TRAIN_BATCH_SIZE" \
+        --output_path "$PARTITION_META_PATH"
+fi
 
 make -C sampling_server clean
 make -C sampling_server -j "$BUILD_JOBS"
